@@ -229,6 +229,48 @@ class GaussianDiffusion:
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    def q_sample_all_timesteps(self, x_start, max_t=None, noise=None):
+        """
+        Generate noisy versions of x_start for all timesteps from 0 to max_t - 1.
+        Args:
+            x_start: tensor of shape (N, ...)
+            max_t: int, total number of timesteps to generate (default to self.num_timesteps)
+            noise: optional noise tensor of shape (N, max_t, ...), if None, generated randomly
+
+        Returns:
+            Tensor of shape (N, max_t, ...), noisy versions of x_start for each timestep
+        """
+        N = x_start.shape[0]
+        if max_t is None:
+            max_t = self.num_timesteps
+
+        # Create tensor of timesteps [0, 1, 2, ..., max_t-1]
+        timesteps = th.arange(max_t - 1, -1, -1, device=x_start.device, dtype=th.long)
+
+        # Expand timesteps to (N, max_t) and then flatten to (N*max_t)
+        timesteps_expanded = timesteps.unsqueeze(0).repeat(N, 1).view(-1)
+
+        # Expand x_start to (N, max_t, ...) then flatten to (N*max_t, ...)
+        x_start_expanded = x_start.unsqueeze(1).expand(-1, max_t, *x_start.shape[1:]).reshape(-1, *x_start.shape[1:])
+
+        # Prepare noise
+        if noise is None:
+            noise = th.randn_like(x_start_expanded)
+        else:
+            noise = noise.reshape(-1, *x_start.shape[1:])
+
+        # Extract alphas for each timestep, shape broadcasted to x_start_expanded
+        sqrt_alphas = _extract_into_tensor(self.sqrt_alphas_cumprod, timesteps_expanded, x_start_expanded.shape)
+        sqrt_one_minus_alphas = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, timesteps_expanded, x_start_expanded.shape)
+
+        # Compute noisy samples for all timesteps at once
+        x_t_flat = sqrt_alphas * x_start_expanded + sqrt_one_minus_alphas * noise
+
+        # Reshape back to (N, max_t, ...)
+        x_t = x_t_flat.view(N, max_t, *x_start.shape[1:])
+        return x_t
+
+
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """
         Compute the mean and variance of the diffusion posterior:
@@ -712,7 +754,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -728,54 +770,63 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)
+        x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise)
 
         terms = {}
 
+        # KL Loss is not needed
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
-            if self.loss_type == LossType.RESCALED_KL:
-                terms["loss"] *= self.num_timesteps
+            raise NotImplementedError(self.loss_type)
+            # terms["loss"] = self._vb_terms_bpd(
+            #     model=model,
+            #     x_start=x_start,
+            #     x_t=x_t,
+            #     t=t,
+            #     clip_denoised=False,
+            #     model_kwargs=model_kwargs,
+            # )["output"]
+            # if self.loss_type == LossType.RESCALED_KL:
+            #     terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, t, **model_kwargs)
+            model_output = model(x_t_all, **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+                T, B, C = x_t_all.shape[:3]
+                assert model_output.shape == (T, B, C * 2, *x_t_all.shape[3:])
                 model_output, model_var_values = th.split(model_output, C, dim=1)
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-                if self.loss_type == LossType.RESCALED_MSE:
+                # frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+                # terms["vb"] = self._vb_terms_bpd(
+                #     model=lambda *args, r=frozen_out: r,
+                #     x_start=x_start,
+                #     x_t=x_t,
+                #     t=t,
+                #     clip_denoised=False,
+                # )["output"]
+                # if self.loss_type == LossType.RESCALED_MSE:
                     # Divide by 1000 for equivalence with initial implementation.
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.num_timesteps / 1000.0
+                    # terms["vb"] *= self.num_timesteps / 1000.0
 
-            target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape
+            # target = {
+            #     # ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+            #     #     x_start=x_start, x_t=x_t, t=t
+            #     # )[0],
+            #     ModelMeanType.START_X: x_start,
+            #     ModelMeanType.EPSILON: noise,
+            # }[self.model_mean_type]
+            TB = model_output.shape[0] * model_output.shape[1]
+            eos_patch = th.ones_like(x_start[0])
+            target = th.cat([x_t_all.view(TB, *x_t_all.shape[2:])[1:], eos_patch.unsqueeze(0)], dim=0)
+            
+            model_output = model_output.view(TB, *model_output.shape[2:])  # flatten batch and time
+            
+            assert model_output.shape == target.shape
+
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
