@@ -229,6 +229,7 @@ class GaussianDiffusion:
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    # ！！！adapted from q_sample
     def q_sample_all_timesteps(self, x_start, max_t=None, noise=None):
         """
         Generate noisy versions of x_start for all timesteps from 0 to max_t - 1.
@@ -770,11 +771,12 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
+        # ！！！q_sample-> q_sample_all_timesteps
         x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise)
 
         terms = {}
 
-        # KL Loss is not needed
+        # ！！！KL Loss and vb loss is not needed for now
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             raise NotImplementedError(self.loss_type)
             # terms["loss"] = self._vb_terms_bpd(
@@ -819,6 +821,8 @@ class GaussianDiffusion:
             #     ModelMeanType.START_X: x_start,
             #     ModelMeanType.EPSILON: noise,
             # }[self.model_mean_type]
+
+            # ！！！loss calculation
             TB = model_output.shape[0] * model_output.shape[1]
             eos_patch = th.ones_like(x_start[0])
             target = th.cat([x_t_all.view(TB, *x_t_all.shape[2:])[1:], eos_patch.unsqueeze(0)], dim=0)
