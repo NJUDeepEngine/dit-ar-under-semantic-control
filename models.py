@@ -247,6 +247,77 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
+    ###todo 
+    def autoregressive_forward(self, x, t, y, eos_threshold=0.99, max_gen_len=1024):
+        """
+        Autoregressive generation for DiT with EOS-based stopping.
+        
+        Args:
+            x: (B, C, H, W) - initial Gaussian noise image
+            t: (B,)         - diffusion timestep
+            y: (B,)         - class label
+            eos_threshold: float - cosine similarity threshold for EOS
+            max_gen_len: int     - max number of generation steps after noise
+
+        Returns:
+            x_img: (B, C, H, W) - generated image
+        """
+        B = x.shape[0]
+        device = x.device
+
+        # 1. Get initial patch tokens from noisy input image
+        patch_tokens = self.x_embedder(x)  # (B, T_noise, D)
+        patch_dim = patch_tokens.shape[-1]
+        tokens = patch_tokens              # Don't truncate
+        T_initial = tokens.shape[1]
+
+        # 2. Get conditional embeddings
+        t_emb = self.t_embedder(t)                  # (B, D)
+        y_emb = self.y_embedder(y, self.training)   # (B, D)
+        cond = t_emb + y_emb                        # (B, D)
+
+        # 3. Positional embedding
+        pos_embed = self.pos_embed  # (1, T_max, D)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for step in range(max_gen_len):
+            T_cur = tokens.shape[1]
+            pos = pos_embed[:, :T_cur, :]  # (1, T_cur, D)
+            x_input = tokens + pos         # (B, T_cur, D)
+
+            # Pass through transformer blocks
+            for block in self.blocks:
+                x_input = block(x_input, cond)  # (B, T_cur, D)
+
+            # Get last output token (predicted next patch)
+            out_token = self.final_layer(x_input, cond)[:, -1:, :]  # (B, 1, D)
+
+            # For finished samples, reuse last token (prevent update)
+            last_token = tokens[:, -1:, :]  # (B, 1, D)
+            out_token = torch.where(
+                finished.view(B, 1, 1),  # (B, 1, 1)
+                last_token,             # use previous token
+                out_token               # use new generated token
+            )
+
+            # Append to token sequence
+            tokens = torch.cat([tokens, out_token], dim=1)  # (B, T+1, D)
+
+            # Check EOS for each sample
+            sim = F.cosine_similarity(
+                out_token, self.eos_token_embed.expand_as(out_token), dim=-1
+            ).squeeze(-1)  # (B,)
+            is_eos = sim > eos_threshold
+            finished = finished | is_eos
+
+            if finished.all():
+                break
+
+        # Decode final token sequence to image
+        x_img = self.unpatchify(tokens)  # (B, C, H, W)
+        return x_img
+
+    
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
