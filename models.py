@@ -247,7 +247,7 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    ###todo 
+    ###！！！ todo 
     def autoregressive_forward(self, x, t, y, eos_threshold=0.99, max_gen_len=1024):
         """
         Autoregressive generation for DiT with EOS-based stopping.
