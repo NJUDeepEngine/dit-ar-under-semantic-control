@@ -100,3 +100,47 @@ def to_patch_seq(x, patch_size):
     x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
     return x
 
+def from_patch_seq(patch_seq, eos_token, patch_size, patch_num, out_channels):
+    """
+    Args:
+        patch_seq: (B, L, C, P, P)
+        eos_token: (C, P, P)
+        patch_size: int
+        patch_num: 每张图的 patch 数（int），必须是平方数（即 patch_num = h * w）
+        out_channels: 通道数 C
+    Returns:
+        imgs: (B, C, H, W)，按有效 patch 解码的图像
+    """
+    B, L, C, P, _ = patch_seq.shape
+    assert patch_num <= L
+    assert P == patch_size
+    assert C == out_channels
+
+    h = w = int(patch_num ** 0.5)
+    assert h * w == patch_num, "patch_num 必须是平方数"
+
+    eos_mask = (patch_seq == eos_token.view(1, 1, C, P, P)).all(dim=(2, 3, 4))  # (B, L)
+    eos_pos = eos_mask.float().argmax(dim=1)  # (B,)
+    no_eos = (eos_mask.sum(dim=1) == 0)
+    eos_pos[no_eos] = patch_seq.shape[1]
+
+    imgs = []
+    for i in range(B):
+        valid_end = eos_pos[i].item()
+        valid_start = max(0, valid_end - patch_num)
+        x = patch_seq[i, valid_start:valid_end]  # 向前回溯 patch_num 个
+
+        # Padding 使长度为 patch_num
+        valid_len = valid_end - valid_start
+        pad_len = patch_num - valid_len
+        if pad_len > 0:
+            pad = th.zeros(pad_len, C, P, P, device=x.device, dtype=x.dtype)
+            x = th.cat([pad, x], dim=0)  # pad 在前面补齐
+
+        x = x.view(h, w, C, P, P)        # (h, w, C, P, P)
+        x = x.permute(2, 0, 3, 1, 4)     # (C, h, P, w, P)
+        x = x.reshape(C, h * P, w * P)   # (C, H, W)
+        imgs.append(x)
+
+    imgs = th.stack(imgs, dim=0)  # (B, C, H, W)
+    return imgs

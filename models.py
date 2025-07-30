@@ -280,6 +280,7 @@ class DiT(nn.Module):
             token_input = block(token_input, cond)
 
         out_token = self.final_layer(token_input, cond)  # (B, T_cur, patch_size ** 2 * out_channels)
+        ###卡住
         output = self.unpatchify(out_token, T)           # ✅ 用原始 timestep T 来还原
 
         if not is_training:
