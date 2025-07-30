@@ -28,7 +28,7 @@ import logging
 import os
 
 from models import DiT_models
-from diffusion import create_diffusion
+from diffusion import create_diffusion,to_patch_seq
 from diffusers.models import AutoencoderKL
 
 

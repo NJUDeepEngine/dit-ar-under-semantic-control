@@ -114,12 +114,22 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
-
+    
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        B, T, _ = x.shape
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        causal_mask = causal_mask.unsqueeze(0).expand(B, -1, -1)  # (B, T, T)
+
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            attn_mask=causal_mask  # 👈 passed to timm.layers.Attention
+        )
+
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
+
 
 
 class FinalLayer(nn.Module):
@@ -158,6 +168,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        max_gen_len=1024  # Maximum length of generated sequence
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -167,11 +178,12 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        #self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
+
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_gen_len, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -189,6 +201,7 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
+        #self.pos_embed = nn.Parameter(torch.zeros(1, num_patch, hidden_size), requires_grad=False)
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -201,8 +214,8 @@ class DiT(nn.Module):
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
@@ -215,126 +228,115 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def patch_embed(self,x):
         """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        x: (B, T, C, H, W)
+        patch_embed: (B, T*Num_Patch, D)
         """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-
-    def forward(self, x, t, y):
+        B,T,C,H,W = x.shape
+        x = x.view(B*T,C,H,W)
+        x_embed=self.x_embedder(x)  # (B*T, Num_Patch, D)
+        Num_Patch,D= x_embed.shape[1], x_embed.shape[2]
+        x_embed = x_embed.view(B, T, Num_Patch, D)
+        x_embed = x_embed.view(B, T * Num_Patch, D)
+        return x_embed
+    
+    def unpatchify(self, x, T):
         """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
-        return x
-
-    ###！！！ todo 
-    def autoregressive_forward(self, x, t, y, eos_threshold=0.99, max_gen_len=1024):
-        """
-        Autoregressive generation for DiT with EOS-based stopping.
-        
-        Args:
-            x: (B, C, H, W) - initial Gaussian noise image
-            t: (B,)         - diffusion timestep
-            y: (B,)         - class label
-            eos_threshold: float - cosine similarity threshold for EOS
-            max_gen_len: int     - max number of generation steps after noise
+        x: (B, T * Num_Patch, patch_size**2 * C)
+        T: int, number of timesteps
 
         Returns:
-            x_img: (B, C, H, W) - generated image
+            imgs: (B, T, C, H, W)
         """
-        B = x.shape[0]
-        device = x.device
+        B, total_patches, patch_dim = x.shape
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        num_patches_per_frame = total_patches // T
+        h = w = int(num_patches_per_frame ** 0.5)
+        assert h * w == num_patches_per_frame, "Patch count must be square"
 
-        # 1. Get initial patch tokens from noisy input image
-        patch_tokens = self.x_embedder(x)  # (B, T_noise, D)
-        patch_dim = patch_tokens.shape[-1]
-        tokens = patch_tokens              # Don't truncate
-        T_initial = tokens.shape[1]
+        x = x.view(B, T, h, w, p, p, c)  # (B, T, h, w, p, p, C)
+        x = x.permute(0, 1, 6, 2, 4, 3, 5)  # (B, T, C, h, p, w, p)
+        imgs = x.reshape(B, T, c, h * p, w * p)  # (B, T, C, H, W)
+        return imgs
+    ###!!! todo
+    def forward(self, x, y, is_training=True):
+        """
+        x: (B, T, C, H, W)
+        y: (B,)
+        Returns:
+            output: (B, T, C, H, W)  # full or last frame depending on mode
+        """
+        B, T, C, H, W = x.shape
+        x = self.patch_embed(x)  # (B, T * num_patches, D)
+        T_cur = x.shape[1]
 
-        # 2. Get conditional embeddings
-        t_emb = self.t_embedder(t)                  # (B, D)
-        y_emb = self.y_embedder(y, self.training)   # (B, D)
-        cond = t_emb + y_emb                        # (B, D)
+        pos = self.pos_embed[:, :T_cur, :]  # (1, len, D)
+        token_input = x + pos               # (B, len, D)
+        cond = self.y_embedder(y, self.training)  # (B, D)
 
-        # 3. Positional embedding
-        pos_embed = self.pos_embed  # (1, T_max, D)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        for block in self.blocks:
+            token_input = block(token_input, cond)
 
-        for step in range(max_gen_len):
-            T_cur = tokens.shape[1]
-            pos = pos_embed[:, :T_cur, :]  # (1, T_cur, D)
-            x_input = tokens + pos         # (B, T_cur, D)
+        out_token = self.final_layer(token_input, cond)  # (B, T_cur, patch_size ** 2 * out_channels)
+        output = self.unpatchify(out_token, T)           # ✅ 用原始 timestep T 来还原
 
-            # Pass through transformer blocks
-            for block in self.blocks:
-                x_input = block(x_input, cond)  # (B, T_cur, D)
+        if not is_training:
+            output = output[:, -1:]  # (B, 1, C, H, W)
 
-            # Get last output token (predicted next patch)
-            out_token = self.final_layer(x_input, cond)[:, -1:, :]  # (B, 1, D)
-
-            # For finished samples, reuse last token (prevent update)
-            last_token = tokens[:, -1:, :]  # (B, 1, D)
-            out_token = torch.where(
-                finished.view(B, 1, 1),  # (B, 1, 1)
-                last_token,             # use previous token
-                out_token               # use new generated token
-            )
-
-            # Append to token sequence
-            tokens = torch.cat([tokens, out_token], dim=1)  # (B, T+1, D)
-
-            # Check EOS for each sample
-            sim = F.cosine_similarity(
-                out_token, self.eos_token_embed.expand_as(out_token), dim=-1
-            ).squeeze(-1)  # (B,)
-            is_eos = sim > eos_threshold
-            finished = finished | is_eos
-
-            if finished.all():
-                break
-
-        # Decode final token sequence to image
-        x_img = self.unpatchify(tokens)  # (B, C, H, W)
-        return x_img
-
+        return output
     
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, y, is_training=True, cfg_scale=1.0):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Forward pass with Classifier-Free Guidance (CFG).
+        
+        Args:
+            x: (B, T, D) - input tokens
+            y: (B,) - class labels, where the second half should be set to null token (e.g., 0 or masked)
+            is_training: bool - whether in training mode
+            cfg_scale: float - guidance scale
+
+        Returns:
+            out: (B, T, D) if is_training else (B, 1, D) - guided prediction
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        # assume batch size is even
+        B = x.shape[0]
+        assert B % 2 == 0, "Batch size must be even for CFG"
+
+        # Duplicate the first half of x for cond/uncond parallel forward
+        half_x = x[:B // 2]
+        half_y = y[:B // 2]
+
+        x_combined = torch.cat([half_x, half_x], dim=0)  # (B, T, D)
+        y_combined = torch.cat([half_y, torch.zeros_like(half_y)], dim=0)  # conditional + unconditional labels
+
+        T_cur = x_combined.shape[1]
+        pos = self.pos_embed[:, :T_cur, :]  # (1, T_cur, D)
+        token_input = x_combined + pos      # (B, T, D)
+
+        cond = self.y_embedder(y_combined, self.training)  # (B, D)
+
+        for block in self.blocks:
+            token_input = block(token_input, cond)  # (B, T, D)
+
+        # Final output
+        if is_training:
+            out = self.final_layer(token_input, cond)  # (B, T, D)
+        else:
+            out = self.final_layer(token_input, cond)[:, -1:, :]  # (B, 1, D)
+
+        # Split into conditional / unconditional parts
+        cond_out, uncond_out = out.chunk(2, dim=0)
+
+        # Apply classifier-free guidance
+        guided_out = uncond_out + cfg_scale * (cond_out - uncond_out)
+
+        # Duplicate guided result to maintain batch size (if needed downstream)
+        final = torch.cat([guided_out, guided_out], dim=0)  # (B/2 * 2, T or 1, D)
+
+        return final
+
 
 
 #################################################################################

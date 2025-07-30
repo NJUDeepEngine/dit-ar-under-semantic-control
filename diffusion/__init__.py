@@ -44,3 +44,17 @@ def create_diffusion(
         loss_type=loss_type
         # rescale_timesteps=rescale_timesteps,
     )
+
+# Dataset 或 dataloader 里
+# 原始数据: x (B, T, C, H, W)
+
+def to_patch_seq(x, patch_size):
+    B, T, C, H, W = x.shape
+    assert H % patch_size == 0 and W % patch_size == 0
+    h, w = H // patch_size, W // patch_size
+
+    x = x.reshape(B, T, C, h, patch_size, w, patch_size)  # 分 patch
+    x = x.permute(0, 1, 3, 5, 2, 4, 6)  # B, T, h, w, C, p, p
+    x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
+    return x
+
