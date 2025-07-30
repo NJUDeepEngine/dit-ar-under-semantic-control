@@ -42,6 +42,17 @@ class ModelVarType(enum.Enum):
     FIXED_LARGE = enum.auto()
     LEARNED_RANGE = enum.auto()
 
+#！！！referenceType
+class ModelReferenceType(enum.Enum):
+    """
+    What is used as the model's output variance.
+    The LEARNED_RANGE option has been added to allow the model to predict
+    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
+    """
+
+    PATCH_LEVEL = enum.auto()
+    FIXED_TIMESTEP = enum.auto()
+    DYNAMIC_TIMESTEP = enum.auto()
 
 class LossType(enum.Enum):
     MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
@@ -156,12 +167,16 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        loss_type
+        loss_type,
+        model_reference_type=None
     ):
 
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
+        if model_reference_type==None:
+            assert "记得把model_reference_type传给diffusion，这是一个咱们新增的变量，记得传进来以后删掉这一行，再删掉入参的=None" and False
+        self.model_reference_type = model_reference_type
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -770,10 +785,12 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start.unsqueeze(1).expand(-1, self.num_timesteps, *x_start.shape[1:]))
+
         # ！！！q_sample-> q_sample_all_timesteps
         x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise)
-
+        x_t_all = model.patch_embed(x_t_all) # (B, T, C, H, W) -> (B, T, num_patch, D)
+        B, T, N, D = x_t_all.shape
         terms = {}
 
         # ！！！KL Loss and vb loss is not needed for now
@@ -790,14 +807,14 @@ class GaussianDiffusion:
             # if self.loss_type == LossType.RESCALED_KL:
             #     terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t_all, **model_kwargs)
+            model_output = model(x_t_all.view(B, T*N, D), **model_kwargs) # (B, T*N, D)
+            
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                T, B, C = x_t_all.shape[:3]
-                assert model_output.shape == (T, B, C * 2, *x_t_all.shape[3:])
+                assert model_output.shape == x_t_all.shape
                 model_output, model_var_values = th.split(model_output, C, dim=1)
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
@@ -814,13 +831,13 @@ class GaussianDiffusion:
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     # terms["vb"] *= self.num_timesteps / 1000.0
 
-            # target = {
-            #     # ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-            #     #     x_start=x_start, x_t=x_t, t=t
-            #     # )[0],
-            #     ModelMeanType.START_X: x_start,
-            #     ModelMeanType.EPSILON: noise,
-            # }[self.model_mean_type]
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t, t=t
+                )[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+            }[self.model_mean_type]
 
             # ！！！loss calculation
             TB = model_output.shape[0] * model_output.shape[1]
