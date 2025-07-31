@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 import enum
 
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq
 
 
 def mean_flat(tensor):
@@ -43,16 +43,15 @@ class ModelVarType(enum.Enum):
     LEARNED_RANGE = enum.auto()
 
 #！！！referenceType
-class ModelReferenceType(enum.Enum):
+class EpsilonType(enum.Enum):
     """
     What is used as the model's output variance.
     The LEARNED_RANGE option has been added to allow the model to predict
     values between FIXED_SMALL and FIXED_LARGE, making its job easier.
     """
 
-    PATCH_LEVEL = enum.auto()
-    FIXED_TIMESTEP = enum.auto()
-    DYNAMIC_TIMESTEP = enum.auto()
+    FIXED = enum.auto()
+    DISTURBED = enum.auto()
 
 class LossType(enum.Enum):
     MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
@@ -168,15 +167,15 @@ class GaussianDiffusion:
         model_mean_type,
         model_var_type,
         loss_type,
-        model_reference_type=None
+        epsilon_type=None
     ):
 
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
-        if model_reference_type==None:
-            assert "记得把model_reference_type传给diffusion，这是一个咱们新增的变量，记得传进来以后删掉这一行，再删掉入参的=None" and False
-        self.model_reference_type = model_reference_type
+        if epsilon_type==None:
+            assert "记得把epsilon_type传给diffusion，这是一个咱们新增的变量，记得传进来以后删掉这一行，再删掉入参的=None" and False
+        self.epsilon_type = EpsilonType.FIXED
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -227,6 +226,7 @@ class GaussianDiffusion:
         log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
+
     def q_sample(self, x_start, t, noise=None):
         """
         Diffuse the data for a given number of diffusion steps.
@@ -260,7 +260,7 @@ class GaussianDiffusion:
         if max_t is None:
             max_t = self.num_timesteps
 
-        # Create tensor of timesteps [0, 1, 2, ..., max_t-1]
+        # Create tensor of timesteps [max_t-1,  ..., 2, 1, 0]
         timesteps = th.arange(max_t - 1, -1, -1, device=x_start.device, dtype=th.long)
 
         # Expand timesteps to (N, max_t) and then flatten to (N*max_t)
@@ -309,6 +309,48 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    #！！！批量计算先验ground truth
+    def q_all_posterior_mean_variance(self, x_start, x_t_all):
+        """
+        Compute q(x_{t-1} | x_t, x_0) for each patch at each timestep.
+
+        Args:
+            x_start: (B, C, H, W) clean image
+            x_t_all: (B, TN, C, H, W) noised patches at all t
+            noise: (B, TN, C, H, W) optionally the noise added to x_start to get x_t_all
+
+        Returns:
+            posterior_mean: (B, TN, C, H, W)
+            posterior_variance: (B, TN, C, H, W)
+            posterior_log_variance: (B, TN, C, H, W)
+        """
+        B, TN, C, H, W = x_t_all.shape
+        device = x_t_all.device
+        T = self.num_timesteps
+        assert TN % T == 0, "TN must be divisible by num_timesteps"
+        N_patch = TN // T
+
+        # Step 1: Expand x_start to [B, TN, C, H, W]
+        x_start_expanded = x_start.unsqueeze(1).expand(B, TN, C, H, W)
+
+        # Step 2: Construct time indices t: [T-1]*K + [T-2]*K + ... + [0]*K
+        t_per_patch = th.arange(T - 1, -1, -1, device=device).repeat_interleave(N_patch)  # (TN,)
+        t = t_per_patch.unsqueeze(0).expand(B, -1)  # (B, TN)
+
+        # Step 3: Compute posterior mean
+        coef1 = _extract_into_tensor(self.posterior_mean_coef1, t, x_t_all.shape)  # (B, TN, C, H, W)
+        coef2 = _extract_into_tensor(self.posterior_mean_coef2, t, x_t_all.shape)
+
+        posterior_mean = coef1 * x_start_expanded + coef2 * x_t_all  # (B, TN, C, H, W)
+
+        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t_all.shape)
+        posterior_log_variance_clipped = _extract_into_tensor(
+            self.posterior_log_variance_clipped, t, x_t_all.shape
+        )
+
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+
     def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -341,14 +383,15 @@ class GaussianDiffusion:
             extra = None
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
-            assert model_output.shape == (B, C * 2, *x.shape[2:])
-            model_output, model_var_values = th.split(model_output, C, dim=1)
-            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-            # The model_var_values is [-1, 1] for [min_var, max_var].
-            frac = (model_var_values + 1) / 2
-            model_log_variance = frac * max_log + (1 - frac) * min_log
-            model_variance = th.exp(model_log_variance)
+            raise NotImplementedError
+            # assert model_output.shape == (B, C * 2, *x.shape[2:])
+            # model_output, model_var_values = th.split(model_output, C, dim=1)
+            # min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            # max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            # # The model_var_values is [-1, 1] for [min_var, max_var].
+            # frac = (model_var_values + 1) / 2
+            # model_log_variance = frac * max_log + (1 - frac) * min_log
+            # model_variance = th.exp(model_log_variance)
         else:
             model_variance, model_log_variance = {
                 # for fixedlarge, we set the initial (log-)variance like so
@@ -568,6 +611,22 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
+    def autoregressive_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        if cond_fn is not None or denoised_fn is not None or clip_denoised==True:
+            raise NotImplementedError("cond_fn/denoised_fn/clip_denoised.") 
+        pass
+
     def ddim_sample(
         self,
         model,
@@ -782,71 +841,63 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+        
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
-            noise = th.randn_like(x_start.unsqueeze(1).expand(-1, self.num_timesteps, *x_start.shape[1:]))
-
+            noise_single = th.randn_like(x_start)  # (B, C, H, W)，一份噪声图
+            noise = noise_single.unsqueeze(1).expand(-1, self.num_timesteps, *x_start.shape[1:])  # 扩展到 (B, T, C, H, W)
+            if self.epsilon_type == EpsilonType.DISTURBED:
+                disturbance_strength = 0.05  # 轻微扰动幅度
+                disturbance = disturbance_strength * th.randn_like(noise)
+                noise = noise + disturbance
         # ！！！q_sample-> q_sample_all_timesteps
-        x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise)
-        x_t_all = model.patch_embed(x_t_all) # (B, T, C, H, W) -> (B, T, num_patch, D)
-        B, T, N, D = x_t_all.shape
+        x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise) # (B, C, H, W) -> (B, T, C, H, W)
+        x_t_all = to_patch_seq(x_t_all, model.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
+        
+        B, TN, C, H, W = x_t_all.shape
         terms = {}
 
         # ！！！KL Loss and vb loss is not needed for now
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             raise NotImplementedError(self.loss_type)
-            # terms["loss"] = self._vb_terms_bpd(
-            #     model=model,
-            #     x_start=x_start,
-            #     x_t=x_t,
-            #     t=t,
-            #     clip_denoised=False,
-            #     model_kwargs=model_kwargs,
-            # )["output"]
-            # if self.loss_type == LossType.RESCALED_KL:
-            #     terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t_all.view(B, T*N, D), **model_kwargs) # (B, T*N, D)
+            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w)
             
-
+            #这是预测均值和方差时，此时通道数由3变为6
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                assert model_output.shape == x_t_all.shape
-                model_output, model_var_values = th.split(model_output, C, dim=1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
-                # frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                # terms["vb"] = self._vb_terms_bpd(
-                #     model=lambda *args, r=frozen_out: r,
-                #     x_start=x_start,
-                #     x_t=x_t,
-                #     t=t,
-                #     clip_denoised=False,
-                # )["output"]
-                # if self.loss_type == LossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    # terms["vb"] *= self.num_timesteps / 1000.0
-
-            target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
-
-            # ！！！loss calculation
-            TB = model_output.shape[0] * model_output.shape[1]
-            eos_patch = th.ones_like(x_start[0])
-            target = th.cat([x_t_all.view(TB, *x_t_all.shape[2:])[1:], eos_patch.unsqueeze(0)], dim=0)
+                raise NotImplementedError(self.loss_type)
             
-            model_output = model_output.view(TB, *model_output.shape[2:])  # flatten batch and time
+            eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, H, W)
+            if self.model_mean_type == ModelMeanType.PREVIOUS_X:
+                target = self.q_all_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t_all
+                )[0]         
+            elif self.model_mean_type == ModelMeanType.START_X:
+                # 先扩展成所有时间步
+                x_start_all = x_start.unsqueeze(1).expand(-1, self.num_timesteps, -1, -1, -1)  # (B, T, C, H, W)
+                x_start_all = to_patch_seq(x_start_all, model.patch_size)  # (B, TN, C, H, W)
+
+                # 添加 eos patch
+                target = th.cat([
+                    x_start_all[:, 1:],  # 跟 x_t 对齐：第 i 个 patch 对应的是 t=i 的 x_t
+                    eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
+                ], dim=1)  # (B, TN, C, H, W)
+            elif self.model_mean_type == ModelMeanType.EPSILON:
+                noise = to_patch_seq(noise, model.patch_size)
+                target = th.cat([
+                    noise[:, 1:],        # (B, T-1, C, H, W)
+                    eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
+                ], dim=1)             
             
             assert model_output.shape == target.shape
+
+            # Merge B and T to treat each patch as一个样本点
+            model_output = model_output.view(B * TN, C, H, W)
+            target = target.view(B * TN, C, H, W)
 
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
