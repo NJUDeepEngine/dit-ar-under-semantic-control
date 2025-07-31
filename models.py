@@ -159,9 +159,10 @@ class DiT(nn.Module):
     def __init__(
         self,
         input_size=32,
-        patch_size=2,
+        patch_size=4,
         in_channels=4,
         hidden_size=1152,
+        num_patches=64,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
@@ -177,10 +178,11 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        #self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         #self.t_embedder = TimestepEmbedder(hidden_size)
+        self.patch_proj = nn.Linear(in_channels * patch_size * patch_size, hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
+        self.num_patches = num_patches
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, max_gen_len, hidden_size), requires_grad=False)
@@ -202,14 +204,15 @@ class DiT(nn.Module):
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         #self.pos_embed = nn.Parameter(torch.zeros(1, num_patch, hidden_size), requires_grad=False)
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
+        #w = self.x_embedder.proj.weight.data
+        #nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        #nn.init.constant_(self.x_embedder.proj.bias, 0)
+        nn.init.xavier_uniform_(self.patch_proj.weight)
+        nn.init.constant_(self.patch_proj.bias, 0)
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
@@ -227,115 +230,63 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def patch_embed(self,x):
-        """
-        x: (B, T, C, H, W)
-        patch_embed: (B, T*Num_Patch, D)
-        """
-        B,T,C,H,W = x.shape
-        x = x.view(B*T,C,H,W)
-        x_embed=self.x_embedder(x)  # (B*T, Num_Patch, D)
-        Num_Patch,D= x_embed.shape[1], x_embed.shape[2]
-        x_embed = x_embed.view(B, T, Num_Patch, D)
-        x_embed = x_embed.view(B, T * Num_Patch, D)
-        return x_embed
     
-    def unpatchify(self, x, T):
-        """
-        x: (B, T * Num_Patch, patch_size**2 * C)
-        T: int, number of timesteps
-
-        Returns:
-            imgs: (B, T, C, H, W)
-        """
-        B, total_patches, patch_dim = x.shape
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        num_patches_per_frame = total_patches // T
-        h = w = int(num_patches_per_frame ** 0.5)
-        assert h * w == num_patches_per_frame, "Patch count must be square"
-
-        x = x.view(B, T, h, w, p, p, c)  # (B, T, h, w, p, p, C)
-        x = x.permute(0, 1, 6, 2, 4, 3, 5)  # (B, T, C, h, p, w, p)
-        imgs = x.reshape(B, T, c, h * p, w * p)  # (B, T, C, H, W)
-        return imgs
     ###!!! todo
     def forward(self, x, y, is_training=True):
         """
-        x: (B, T, C, H, W)
+        x: (B, LEN, C, P, P)
         y: (B,)
-        Returns:
-            output: (B, T, C, H, W)  # full or last frame depending on mode
         """
-        B, T, C, H, W = x.shape
-        x = self.patch_embed(x)  # (B, T * num_patches, D)
-        T_cur = x.shape[1]
+        B, LEN, C, P, P2 = x.shape
+        assert P == self.patch_size and P2 == self.patch_size, "Patch size mismatch"
 
-        pos = self.pos_embed[:, :T_cur, :]  # (1, len, D)
-        token_input = x + pos               # (B, len, D)
-        cond = self.y_embedder(y, self.training)  # (B, D)
+        # Flatten (C,P,P) -> (C*P*P)
+        x = x.view(B, LEN, -1)  # (B, LEN, C*P*P)
+        x = self.patch_proj(x)  # (B, LEN, D)
+
+        pos = self.pos_embed[:, :LEN, :]
+        token_input = x + pos  # (B, LEN, D)
+        cond = self.y_embedder(y, self.training)
 
         for block in self.blocks:
-            token_input = block(token_input, cond)
+            token_input = block(token_input, cond)  # (B, LEN, D)
 
-        out_token = self.final_layer(token_input, cond)  # (B, T_cur, patch_size ** 2 * out_channels)
-        output = self.unpatchify(out_token, T)           # ✅ 用原始 timestep T 来还原
+        out_token = self.final_layer(token_input, cond)  # (B, LEN, C*P*P)
+        out_token = out_token.view(B, LEN, self.out_channels, P, P)
 
         if not is_training:
-            output = output[:, -1:]  # (B, 1, C, H, W)
-
-        return output
+            return out_token[:, -1:]  # (B, 1, C, P, P)
+        return out_token  # (B, LEN, C, P, P)
     
     def forward_with_cfg(self, x, y, is_training=True, cfg_scale=1.0):
         """
-        Forward pass with Classifier-Free Guidance (CFG).
-        
+        Classifier-Free Guidance forward.
         Args:
-            x: (B, T, D) - input tokens
-            y: (B,) - class labels, where the second half should be set to null token (e.g., 0 or masked)
-            is_training: bool - whether in training mode
-            cfg_scale: float - guidance scale
-
+            x: (B, LEN, C, P, P)
+            y: (B,)
+            cfg_scale: float
         Returns:
-            out: (B, T, D) if is_training else (B, 1, D) - guided prediction
+            (B, LEN, C, P, P)
         """
-        # assume batch size is even
-        B = x.shape[0]
-        assert B % 2 == 0, "Batch size must be even for CFG"
+        assert x.shape[0] % 2 == 0, "Batch size must be even for CFG"
 
-        # Duplicate the first half of x for cond/uncond parallel forward
-        half_x = x[:B // 2]
-        half_y = y[:B // 2]
+        half = x[:len(x) // 2]        # (B/2, LEN, C, P, P)
+        half_y = y[:len(y) // 2]      # (B/2,)
+        combined = torch.cat([half, half], dim=0)             # (B, LEN, C, P, P)
+        y_combined = torch.cat([half_y, torch.zeros_like(half_y)], dim=0)  # (B,)
 
-        x_combined = torch.cat([half_x, half_x], dim=0)  # (B, T, D)
-        y_combined = torch.cat([half_y, torch.zeros_like(half_y)], dim=0)  # conditional + unconditional labels
+        model_out = self.forward(combined, y_combined, is_training=is_training)  # (B, LEN, C, P, P)
 
-        T_cur = x_combined.shape[1]
-        pos = self.pos_embed[:, :T_cur, :]  # (1, T_cur, D)
-        token_input = x_combined + pos      # (B, T, D)
+        # Split channels
+        eps, rest = model_out[:, :, :3], model_out[:, :, 3:]  # (B, LEN, 3, P, P), (B, LEN, rest, P, P)
+        cond_eps, uncond_eps = eps.chunk(2, dim=0)  # (B/2, LEN, 3, P, P)
+        guided_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
 
-        cond = self.y_embedder(y_combined, self.training)  # (B, D)
+        # Duplicate to match batch size (optional)
+        eps = torch.cat([guided_eps, guided_eps], dim=0)  # (B, LEN, 3, P, P)
+        out = torch.cat([eps, rest], dim=2)  # (B, LEN, C, P, P)
+        return out
 
-        for block in self.blocks:
-            token_input = block(token_input, cond)  # (B, T, D)
-
-        # Final output
-        if is_training:
-            out = self.final_layer(token_input, cond)  # (B, T, D)
-        else:
-            out = self.final_layer(token_input, cond)[:, -1:, :]  # (B, 1, D)
-
-        # Split into conditional / unconditional parts
-        cond_out, uncond_out = out.chunk(2, dim=0)
-
-        # Apply classifier-free guidance
-        guided_out = uncond_out + cfg_scale * (cond_out - uncond_out)
-
-        # Duplicate guided result to maintain batch size (if needed downstream)
-        final = torch.cat([guided_out, guided_out], dim=0)  # (B/2 * 2, T or 1, D)
-
-        return final
 
 
 
@@ -343,6 +294,29 @@ class DiT(nn.Module):
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+
+def build_2d_temporal_pos_embed(D, T, patch_num):
+    """
+    D: embedding dim
+    T: max time steps
+    patch_num: number of patches per frame (must be square number)
+    return: pos_embed of shape (1, T * patch_num, D)
+    """
+    grid_size = int(patch_num ** 0.5)
+    assert grid_size * grid_size == patch_num, "patch_num must be a square number"
+
+    # 1. Spatial (x, y) positional embedding: (patch_num, D)
+    spatial = get_2d_sincos_pos_embed(embed_dim=D, grid_size=grid_size)  # (patch_num, D)
+    spatial = np.tile(spatial, (T, 1))  # repeat T times → (T * patch_num, D)
+
+    # 2. Temporal (t) positional embedding: (T, D)
+    temporal = get_1d_sincos_pos_embed_from_grid(D, np.arange(T)) # (T, D)
+    temporal = np.repeat(temporal, patch_num, axis=0)    # repeat each t → (T * patch_num, D)
+
+    # 3. Add them
+    pos_embed = spatial + temporal  # (T * patch_num, D)
+    return pos_embed[None]  # (1, LEN, D)
+
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """

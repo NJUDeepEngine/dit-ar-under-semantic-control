@@ -5,7 +5,7 @@
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
-from .diffusion_utils import to_patch_seq
+from .diffusion_utils import to_patch_seq,from_patch_seq
 
 
 def create_diffusion(
@@ -45,4 +45,3 @@ def create_diffusion(
         loss_type=loss_type
         # rescale_timesteps=rescale_timesteps,
     )
-
