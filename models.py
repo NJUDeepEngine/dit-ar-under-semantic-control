@@ -179,7 +179,7 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         #self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        #self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size)
         self.patch_proj = nn.Linear(in_channels * patch_size * patch_size, hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.num_patches = num_patches
@@ -217,8 +217,8 @@ class DiT(nn.Module):
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        #nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        #nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:

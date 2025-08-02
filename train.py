@@ -28,7 +28,7 @@ import logging
 import os
 
 from models import DiT_models
-from diffusion import create_diffusion,to_patch_seq
+from diffusion import create_diffusion,to_patch_seq,from_patch_seq
 from diffusers.models import AutoencoderKL
 
 
@@ -265,5 +265,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--max_gen_len", type=int, default=1024)
     args = parser.parse_args()
     main(args)
