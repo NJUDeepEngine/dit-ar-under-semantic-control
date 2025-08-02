@@ -183,7 +183,7 @@ class DiT(nn.Module):
         self.patch_proj = nn.Linear(in_channels * patch_size * patch_size, hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.num_patches = num_patches
-
+        self.max_gen_len = max_gen_len
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, max_gen_len, hidden_size), requires_grad=False)
 
@@ -203,8 +203,8 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        #self.pos_embed = nn.Parameter(torch.zeros(1, num_patch, hidden_size), requires_grad=False)
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.num_patches ** 0.5))
+        pos_embed=build_2d_temporal_pos_embed(self.pos_embed.shape[-1], self.max_gen_len, self.num_patches)
+        #pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):

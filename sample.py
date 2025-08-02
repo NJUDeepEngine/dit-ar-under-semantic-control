@@ -61,6 +61,7 @@ def main(args):
     samples = diffusion.p_sample_loop(
         model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
+    samples = diffusion.ar_p_sample_loop(model.forward_with_cfg,z.shape,z,clip_denoised=False,model_kwargs=model_kwargs,progress=True,device=device)
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     samples = vae.decode(samples / 0.18215).sample
 
@@ -81,62 +82,3 @@ if __name__ == "__main__":
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     args = parser.parse_args()
     main(args)
-
-
-"""
-    def unpatchify(self, x):
-        ""
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        ""
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-    ###！！！ todo 
-    def autoregressive_forward(self, x, t, y, eos_threshold=0.99, max_gen_len=1024):
-        B = x.shape[0]
-        device = x.device
-
-        # Initial tokens
-        patch_tokens = self.x_embedder(x)  # (B, T_noise, D)
-        tokens = patch_tokens
-        patch_dim = tokens.shape[-1]
-
-        # Conditioning
-        t_emb = self.t_embedder(t)                  # (B, D)
-        y_emb = self.y_embedder(y, self.training)   # (B, D)
-        cond = t_emb + y_emb                        # (B, D)
-
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for step in range(max_gen_len):
-            out_token = self.forward(tokens, cond)  # (B, 1, D)
-
-            # Keep last token for finished sequences
-            last_token = tokens[:, -1:, :]  # (B, 1, D)
-            out_token = torch.where(
-                finished.view(B, 1, 1),
-                last_token,
-                out_token
-            )
-
-            tokens = torch.cat([tokens, out_token], dim=1)  # (B, T+1, D)
-
-            sim = F.cosine_similarity(
-                out_token, self.eos_token_embed.expand_as(out_token), dim=-1
-            ).squeeze(-1)  # (B,)
-            is_eos = sim > eos_threshold
-            finished = finished | is_eos
-
-            if finished.all():
-                break
-
-        x_img = self.unpatchify(tokens)
-        return x_img
-"""
