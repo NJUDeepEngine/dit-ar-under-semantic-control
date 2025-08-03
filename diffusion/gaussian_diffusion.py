@@ -42,17 +42,6 @@ class ModelVarType(enum.Enum):
     FIXED_LARGE = enum.auto()
     LEARNED_RANGE = enum.auto()
 
-#！！！referenceType
-class EpsilonType(enum.Enum):
-    """
-    What is used as the model's output variance.
-    The LEARNED_RANGE option has been added to allow the model to predict
-    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
-    """
-
-    FIXED = enum.auto()
-    DISTURBED = enum.auto()
-
 class LossType(enum.Enum):
     MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
     RESCALED_MSE = (
@@ -166,16 +155,12 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        loss_type,
-        epsilon_type=None
+        loss_type
     ):
 
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
-        if epsilon_type==None:
-            assert "记得把epsilon_type传给diffusion，这是一个咱们新增的变量，记得传进来以后删掉这一行，再删掉入参的=None" and False
-        self.epsilon_type = EpsilonType.FIXED
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -829,6 +814,31 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
+    #！！！生成扩散噪声序列
+    def generate_diffusion_noise_sequence(self, x_start, max_t):
+        """
+        逐步从 x_start 生成 x_t sequence，每一步应用独立噪声：x_{t+1} = sqrt_alpha * x_t + sqrt(1 - alpha) * noise
+        返回一个 (B, T, C, H, W) 的 x_t_all
+        """
+        B, C, H, W = x_start.shape
+        device = x_start.device
+        x_t_list = []
+        x_t = x_start
+
+        steps = max_t if max_t is not None else self.num_timesteps
+        for t in range(steps):
+            noise = th.randn_like(x_t)
+            sqrt_alpha = self.sqrt_alphas[t]
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[t]
+
+            # forward diffusion step
+            x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
+            x_t_list.append(x_t.unsqueeze(1))  # 加时间维度
+
+        # 拼接成 (B, T, C, H, W)
+        x_t_all = th.cat(x_t_list, dim=1)
+        return x_t_all
+
     def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -844,15 +854,12 @@ class GaussianDiffusion:
         
         if model_kwargs is None:
             model_kwargs = {}
+
         if noise is None:
-            noise_single = th.randn_like(x_start)  # (B, C, H, W)，一份噪声图
-            noise = noise_single.unsqueeze(1).expand(-1, self.num_timesteps, *x_start.shape[1:])  # 扩展到 (B, T, C, H, W)
-            if self.epsilon_type == EpsilonType.DISTURBED:
-                disturbance_strength = 0.05  # 轻微扰动幅度
-                disturbance = disturbance_strength * th.randn_like(noise)
-                noise = noise + disturbance
-        # ！！！q_sample-> q_sample_all_timesteps
-        x_t_all = self.q_sample_all_timesteps(x_start, max_t=self.num_timesteps, noise=noise) # (B, C, H, W) -> (B, T, C, H, W)
+            x_t_all = self.generate_diffusion_noise_sequence(x_start, max_t=t)
+        else:
+            x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
+
         x_t_all = to_patch_seq(x_t_all, model.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
         B, TN, C, H, W = x_t_all.shape
