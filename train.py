@@ -203,7 +203,10 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            #t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            print(x.shape)
+            print("!!!!!!!!!!")
+            t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()
             model_kwargs = dict(y=y)
             #def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -268,6 +271,17 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--max_gen_len", type=int, default=1024)
+    parser.add_argument("--max_gen_len", type=int, default=1000)
     args = parser.parse_args()
     main(args)
+"""
+CUDA_VISIBLE_DEVICES=2,3 torchrun \
+--nnodes=1 \
+--nproc_per_node=2 \
+train.py \
+--model DiT-XL/2 \
+--data-path /path/to/imagenet/train \
+--num-classes 10 \
+--max_gen_len 1000
+
+"""

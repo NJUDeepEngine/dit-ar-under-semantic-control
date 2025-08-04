@@ -1,0 +1,2 @@
+[[34m2025-08-04 23:11:57[0m] Experiment directory created at results/008-DiT-XL-2
+[[34m2025-08-04 23:12:39[0m] DiT Parameters: 966,981,920

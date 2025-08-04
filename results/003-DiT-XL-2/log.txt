@@ -1,0 +1,1 @@
+[[34m2025-08-04 22:56:17[0m] Experiment directory created at results/003-DiT-XL-2

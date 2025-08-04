@@ -1,12 +1,14 @@
-name: DiT
+name: dit
 channels:
   - pytorch
   - nvidia
+  - conda-forge
 dependencies:
-  - python >= 3.8
-  - pytorch >= 1.13
+  - python=3.8
+  - pytorch=2.3.0
   - torchvision
-  - pytorch-cuda=11.7
+  - torchaudio
+  - pytorch-cuda=12.1  # 关键！PyTorch官方预编译的CUDA 12.1版本
   - pip:
     - timm
     - diffusers
