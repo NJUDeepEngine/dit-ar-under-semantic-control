@@ -860,7 +860,7 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        t = th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long) if t is None
+        t_tensor = th.arange(t - 1, -1, -1, device=x_start.device, dtype=th.long) if t is None else th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long)
         # if t is None:
         #     t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
         # elif isinstance(t, int):
