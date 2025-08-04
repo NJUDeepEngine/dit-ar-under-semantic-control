@@ -91,16 +91,22 @@ class SpacedDiffusion(GaussianDiffusion):
     ):  # pylint: disable=signature-differs
         return super().p_mean_variance(self._wrap_model(model), *args, **kwargs)
 
-    def training_losses(
-        self, model, *args, **kwargs
-    ):  # pylint: disable=signature-differs
-        return super().training_losses(self._wrap_model(model), *args, **kwargs)
-
     def condition_mean(self, cond_fn, *args, **kwargs):
         return super().condition_mean(self._wrap_model(cond_fn), *args, **kwargs)
 
     def condition_score(self, cond_fn, *args, **kwargs):
         return super().condition_score(self._wrap_model(cond_fn), *args, **kwargs)
+
+    #！！！新增
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+        # 将缩减时间步映射回原始时间步
+        # t 是 Tensor，比如形状 (B,)
+        # 映射需要针对每个元素操作
+        device = t.device
+        mapped_t = th.tensor([self.timestep_map[int(time.item())] for time in t], device=device, dtype=t.dtype)
+        
+        # 调用父类 training_losses，传入映射后的时间步
+        return super().training_losses(model, x_start, mapped_t, model_kwargs=model_kwargs, noise=noise)
 
     def _wrap_model(self, model):
         if isinstance(model, _WrappedModel):

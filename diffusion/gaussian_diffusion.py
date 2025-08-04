@@ -295,7 +295,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     #！！！批量计算先验ground truth
-    def q_all_posterior_mean_variance(self, x_start, x_t_all):
+    def q_all_posterior_mean_variance(self, x_start, x_t_all, t):
         """
         Compute q(x_{t-1} | x_t, x_0) for each patch at each timestep.
 
@@ -311,7 +311,7 @@ class GaussianDiffusion:
         """
         B, TN, C, H, W = x_t_all.shape
         device = x_t_all.device
-        T = self.num_timesteps
+        T = len(t)
         assert TN % T == 0, "TN must be divisible by num_timesteps"
         N_patch = TN // T
 
@@ -319,7 +319,7 @@ class GaussianDiffusion:
         x_start_expanded = x_start.unsqueeze(1).expand(B, TN, C, H, W)
 
         # Step 2: Construct time indices t: [T-1]*K + [T-2]*K + ... + [0]*K
-        t_per_patch = th.arange(T - 1, -1, -1, device=device).repeat_interleave(N_patch)  # (TN,)
+        t_per_patch = t.repeat_interleave(N_patch)  # (TN,)
         t = t_per_patch.unsqueeze(0).expand(B, -1)  # (B, TN)
 
         # Step 3: Compute posterior mean
@@ -815,31 +815,34 @@ class GaussianDiffusion:
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
     #！！！生成扩散噪声序列
-    def generate_diffusion_noise_sequence(self, x_start, max_t):
+    def generate_diffusion_noise_sequence(self, x_start, t):
         """
         逐步从 x_start 生成 x_t sequence，每一步应用独立噪声：x_{t+1} = sqrt_alpha * x_t + sqrt(1 - alpha) * noise
         返回一个 (B, T, C, H, W) 的 x_t_all
         """
         B, C, H, W = x_start.shape
         device = x_start.device
-        x_t_list = []
+        x_t_list = [x_start]
         x_t = x_start
 
-        steps = max_t if max_t is not None else self.num_timesteps
-        for t in range(steps):
+        
+        for i in range(max(t) + 1):
             noise = th.randn_like(x_t)
-            sqrt_alpha = self.sqrt_alphas[t]
-            sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[t]
+            sqrt_alpha = self.sqrt_alphas[i]
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[i]
 
             # forward diffusion step
             x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
-            x_t_list.append(x_t.unsqueeze(1))  # 加时间维度
+            if i in t:
+                x_t_list.append(x_t.unsqueeze(1))  # 加时间维度
+
+        x_t_list = x_t_list[::-1]  # 从 T-1 到 0 的顺序
 
         # 拼接成 (B, T, C, H, W)
         x_t_all = th.cat(x_t_list, dim=1)
         return x_t_all
 
-    def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -855,10 +858,15 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
+        if t is None:
+            t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
+            
         if noise is None:
-            x_t_all = self.generate_diffusion_noise_sequence(x_start, max_t=t)
+            x_t_all = self.generate_diffusion_noise_sequence(x_start, t=t)
         else:
-            x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
+            raise NotImplementedError("noise is not None, not implemented yet")
+            # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
+
 
         x_t_all = to_patch_seq(x_t_all, model.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
@@ -881,7 +889,7 @@ class GaussianDiffusion:
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, H, W)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t_all
+                    x_start=x_start, x_t=x_t_all, t=t
                 )[0]         
             elif self.model_mean_type == ModelMeanType.START_X:
                 # 先扩展成所有时间步
