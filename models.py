@@ -162,14 +162,13 @@ class DiT(nn.Module):
         patch_size=4,
         in_channels=4,
         hidden_size=1152,
-        num_patches=64,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        max_gen_len=1024  # Maximum length of generated sequence
+        max_gen_len=1000  # Maximum length of generated sequence
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -179,13 +178,14 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         #self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        #self.t_embedder = TimestepEmbedder(hidden_size)
         self.patch_proj = nn.Linear(in_channels * patch_size * patch_size, hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        self.num_patches = num_patches
+        self.num_patches = (input_size // patch_size) ** 2  # 使用整数除法  # Total number of patches (assumes square input)
         self.max_gen_len = max_gen_len
+        self.hidden_size = hidden_size
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_gen_len, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_gen_len*self.num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -205,7 +205,7 @@ class DiT(nn.Module):
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         pos_embed=build_2d_temporal_pos_embed(self.pos_embed.shape[-1], self.max_gen_len, self.num_patches)
         #pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         #w = self.x_embedder.proj.weight.data
@@ -217,8 +217,8 @@ class DiT(nn.Module):
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
@@ -232,7 +232,7 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
     
     ###!!! todo
-    def forward(self, x, y, is_training=True):
+    def forward(self, x,y, is_training=True):
         """
         x: (B, LEN, C, P, P)
         y: (B,)
@@ -246,8 +246,9 @@ class DiT(nn.Module):
 
         pos = self.pos_embed[:, :LEN, :]
         token_input = x + pos  # (B, LEN, D)
-        cond = self.y_embedder(y, self.training)
-
+        #t=self.t_embedder(t)  # (B, D)
+        y= self.y_embedder(y, self.training)
+        cond=y
         for block in self.blocks:
             token_input = block(token_input, cond)  # (B, LEN, D)
 
