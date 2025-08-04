@@ -120,8 +120,9 @@ class DiTBlock(nn.Module):
 
         B, T, _ = x.shape
         causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        causal_mask = causal_mask.unsqueeze(0).expand(B, -1, -1)  # (B, T, T)
-
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (B, T, T)
+        print(causal_mask.shape)  # 应为 [B, T, T]
+        x_1=modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa),
             attn_mask=causal_mask  # 👈 passed to timm.layers.Attention

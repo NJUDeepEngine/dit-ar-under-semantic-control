@@ -203,10 +203,10 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            rand_t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()  # 先采样一个随机整数
+            t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)  # 用该值填充整个batch
             #t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            print(x.shape)
-            print("!!!!!!!!!!")
-            t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()
+            #t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()
             model_kwargs = dict(y=y)
             #def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -265,7 +265,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-batch-size", type=int, default=16)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)

@@ -824,7 +824,7 @@ class GaussianDiffusion:
         """
         B, C, H, W = x_start.shape
         device = x_start.device
-        x_t_list = [x_start]
+        x_t_list = [x_start.unsqueeze(1)]
         x_t = x_start
 
         
@@ -859,8 +859,8 @@ class GaussianDiffusion:
         
         if model_kwargs is None:
             model_kwargs = {}
-
-        t_tensor = th.arange(t - 1, -1, -1, device=x_start.device, dtype=th.long) if t is not None else th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long)
+        t_ = t[0].item() 
+        t_tensor = th.arange(t_ - 1, -1, -1, device=x_start.device, dtype=th.long) if t is not None else th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long)
         # if t is None:
         #     t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
         # elif isinstance(t, int):
@@ -873,7 +873,7 @@ class GaussianDiffusion:
             # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
 
 
-        x_t_all = to_patch_seq(x_t_all, model.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
+        x_t_all = to_patch_seq(x_t_all, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
         B, TN, C, H, W = x_t_all.shape
         terms = {}
