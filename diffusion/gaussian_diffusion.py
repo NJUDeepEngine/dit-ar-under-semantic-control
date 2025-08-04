@@ -860,8 +860,11 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        if t is None:
-            t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
+        t = th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long) if t is None
+        # if t is None:
+        #     t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
+        # elif isinstance(t, int):
+        #     t = th.tensor([t] * x_start.shape[0], device=x_start.device)
             
         if noise is None:
             x_t_all = self.generate_diffusion_noise_sequence(x_start, t=t)
