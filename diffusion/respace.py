@@ -100,10 +100,13 @@ class SpacedDiffusion(GaussianDiffusion):
     #！！！新增
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         # 将缩减时间步映射回原始时间步
-        # t 是 Tensor，比如形状 (B,)
-        # 映射需要针对每个元素操作
-        # device = t.device
-        # mapped_t = th.tensor([self.timestep_map[int(time.item())] for time in t], device=device, dtype=t.dtype)
+        if t is None:
+            t = len(self.timestep_map) - 1
+        # if isinstance(t, int):
+        #     mapper_t = self.timestep_map[t]
+        # else:
+        #     device = t.device
+        #     mapped_t = th.tensor([self.timestep_map[int(time.item())] for time in t], device=device, dtype=t.dtype)
         
         # 调用父类 training_losses，传入映射后的时间步
         return super().training_losses(model, x_start, t, model_kwargs=model_kwargs, noise=noise)

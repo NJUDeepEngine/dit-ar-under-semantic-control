@@ -313,7 +313,7 @@ class GaussianDiffusion:
         """
         B, TN, C, H, W = x_t_all.shape
         device = x_t_all.device
-        T = len(t)
+        T = max(t).item()
         assert TN % T == 0, "TN must be divisible by num_timesteps"
         N_patch = TN // T
 
@@ -321,8 +321,14 @@ class GaussianDiffusion:
         x_start_expanded = x_start.unsqueeze(1).expand(B, TN, C, H, W)
 
         # Step 2: Construct time indices t: [T-1]*K + [T-2]*K + ... + [0]*K
-        t_per_patch = t.repeat_interleave(N_patch)  # (TN,)
-        t = t_per_patch.unsqueeze(0).expand(B, -1)  # (B, TN)
+        t_all = []  # list of per-sample (TN_i,) tensors
+        for i in range(B):
+            Ti = t[i].item()
+            t_i = th.arange(Ti - 1, -1, -1, device=device).repeat_interleave(N_patch)  # (Ti * N_patch,)
+            pad_len = (T - Ti) * N_patch
+            t_i = th.cat([t_i, th.zeros(pad_len, dtype=t_i.dtype, device=device)])  # pad with t=0
+            t_all.append(t_i)
+        t = th.stack(t_all, dim=0)  # (B, TN)
 
         # Step 3: Compute posterior mean
         coef1 = _extract_into_tensor(self.posterior_mean_coef1, t, x_t_all.shape)  # (B, TN, C, H, W)
@@ -819,29 +825,44 @@ class GaussianDiffusion:
     #！！！生成扩散噪声序列
     def generate_diffusion_noise_sequence(self, x_start, t):
         """
-        逐步从 x_start 生成 x_t sequence，每一步应用独立噪声：x_{t+1} = sqrt_alpha * x_t + sqrt(1 - alpha) * noise
-        返回一个 (B, T, C, H, W) 的 x_t_all
+        对每个样本，根据其对应的时间步 t[i]，生成从 x_0 到 x_t[i] 的 noised 图像序列，
+        并将其 reverse 成 [x_t, ..., x_0] 的顺序，左侧填0以对齐。
+
+        Args:
+            x_start: (B, C, H, W)
+            t: (B,) - 每个样本的最大时间步（int Tensor）
+
+        Returns:
+            x_t_all: (B, T_max+1, C, H, W) - 每个样本右对齐有效序列并反转，左侧全0
         """
         B, C, H, W = x_start.shape
         device = x_start.device
-        x_t_list = [x_start.unsqueeze(1)]
-        x_t = x_start
+        T_max = t.max().item()
 
-        
-        for i in range(max(t) + 1):
-            noise = th.randn_like(x_t)
-            sqrt_alpha = self.sqrt_alphas[i]
-            sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[i]
+        x_t_all = th.zeros(B, T_max + 1, C, H, W, device=device)
 
-            # forward diffusion step
-            x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
-            if i in t:
-                x_t_list.append(x_t.unsqueeze(1))  # 加时间维度
+        # 对每个样本单独处理
+        for b in range(B):
+            t_b = t[b].item()
+            x_t = x_start[b]  # (C, H, W)
+            seq = [x_t]  # x_0
 
-        x_t_list = x_t_list[::-1]  # 从 T-1 到 0 的顺序
+            # 从 x_1 到 x_t
+            for step in range(1, t_b + 1):
+                noise = th.randn_like(x_t)
+                sqrt_alpha = self.sqrt_alphas[step - 1]
+                sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[step - 1]
 
-        # 拼接成 (B, T, C, H, W)
-        x_t_all = th.cat(x_t_list, dim=1)
+                x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
+                seq.append(x_t)
+
+            # 反转为 [x_t, ..., x_0]
+            seq = seq[::-1]  # list of (C, H, W)
+            seq_tensor = th.stack(seq, dim=0)  # (t_b+1, C, H, W)
+
+            # 放入 x_t_all 右侧靠齐
+            x_t_all[b, :t_b + 1] = seq_tensor
+
         return x_t_all
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
@@ -859,12 +880,9 @@ class GaussianDiffusion:
         
         if model_kwargs is None:
             model_kwargs = {}
-        t_ = t[0].item() 
-        t_tensor = th.arange(t_ - 1, -1, -1, device=x_start.device, dtype=th.long) if t is not None else th.arange(self.num_timesteps - 1, -1, -1, device=x_start.device, dtype=th.long)
-        # if t is None:
-        #     t = th.tensor([self.num_timesteps - 1] * x_start.shape[0], device=x_start.device)
-        # elif isinstance(t, int):
-        #     t = th.tensor([t] * x_start.shape[0], device=x_start.device)
+        assert t is not None
+        if isinstance(t, int):
+            t = th.tensor([t] * x_start.shape[0], device=x_start.device)
             
         if noise is None:
             x_t_all = self.generate_diffusion_noise_sequence(x_start, t=t)
@@ -915,11 +933,19 @@ class GaussianDiffusion:
             
             assert model_output.shape == target.shape
 
+            # 构造 mask: (B, TN) = 每个样本的有效时间步 t[i] × N_patch
+            N_patch = TN // t.max().item()
+            device = model_output.device
+            t_patch = t * N_patch  # 每个样本的有效 patch 数 (B,)
+            mask = th.arange(TN, device=device).unsqueeze(0) < t_patch.unsqueeze(1)  # (B, TN)
+
+            # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
+            mask = mask.reshape(B * TN, 1, 1, 1).float()
             # Merge B and T to treat each patch as一个样本点
             model_output = model_output.view(B * TN, C, H, W)
             target = target.view(B * TN, C, H, W)
 
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            terms["mse"] = mean_flat((target - model_output) ** 2) * mask
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
