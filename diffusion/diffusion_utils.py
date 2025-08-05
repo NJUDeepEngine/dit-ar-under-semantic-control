@@ -187,3 +187,24 @@ def timesteps_padding(t, mapper = None) -> dict:
         "list_timesteps": list_timesteps,
         "patched_timesteps": patched_timesteps
     }
+
+def expand_timesteps_like_patches(x, t):
+    """
+    Expand timestep tensor t (B, T) into (B, T*N) to match x: (B, T*N, C, P, P)
+
+    Args:
+        x: torch.Tensor of shape (B, T*N, C, P, P)
+        t: torch.LongTensor of shape (B, T)
+
+    Returns:
+        t_expanded: torch.LongTensor of shape (B, T*N)
+    """
+    B, TN, _, _, _ = x.shape
+    B_t, T = t.shape
+    assert B == B_t, "Batch size mismatch"
+    assert TN % T == 0, "Patch count not divisible by timestep count"
+    N = TN // T
+
+    # Expand t: (B, T) → (B, T, N) → (B, T*N)
+    t_expanded = t.unsqueeze(2).expand(B, T, N).reshape(B, TN)
+    return t_expanded

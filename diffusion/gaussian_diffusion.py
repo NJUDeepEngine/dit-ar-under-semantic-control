@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 import enum
 
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq, timesteps_padding
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq, timesteps_padding, expand_timesteps_like_patches
 
 
 def mean_flat(tensor):
@@ -311,14 +311,18 @@ class GaussianDiffusion:
             posterior_log_variance: (B, TN, C, H, W)
         """
         B, TN, C, P, P_ = x_t_all.shape
-        _, _, H, W = x_start.shape
+            
         device = x_t_all.device
         T = t.shape[1]
         assert TN % T == 0, "TN must be divisible by num_timesteps"
         N_patch = TN // T
 
-        # Step 1: Expand x_start to [B, TN, C, P, P]
-        x_start_expanded = to_patch_seq(x_start.unsqueeze(1).expand(B, T, C, H, W), P)
+        if x_start.dim() == 4:
+            _, _, H, W = x_start.shape
+            # 先转成 BTNCPP
+            x_start = to_patch_seq(x_start.unsqueeze(1).expand(B, T, C, H, W), P)
+
+
 
         # Step 2: Construct time indices t: [T-1]*K + [T-2]*K + ... + [0]*K
         t = t.repeat_interleave(N_patch, dim=1)  # (B, TN)
@@ -327,13 +331,12 @@ class GaussianDiffusion:
         coef1 = _extract_into_tensor(self.posterior_mean_coef1, t, x_t_all.shape)  # (B, TN, C, P, P)
         coef2 = _extract_into_tensor(self.posterior_mean_coef2, t, x_t_all.shape)
 
-        posterior_mean = coef1 * x_start_expanded + coef2 * x_t_all  # (B, TN, C, P, P)
+        posterior_mean = coef1 * x_start + coef2 * x_t_all  # (B, TN, C, P, P)
 
         posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t_all.shape)
         posterior_log_variance_clipped = _extract_into_tensor(
             self.posterior_log_variance_clipped, t, x_t_all.shape
         )
-
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
 
@@ -369,15 +372,14 @@ class GaussianDiffusion:
             extra = None
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
-            raise NotImplementedError
-            # assert model_output.shape == (B, C * 2, *x.shape[2:])
-            # model_output, model_var_values = th.split(model_output, C, dim=1)
-            # min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-            # max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-            # # The model_var_values is [-1, 1] for [min_var, max_var].
-            # frac = (model_var_values + 1) / 2
-            # model_log_variance = frac * max_log + (1 - frac) * min_log
-            # model_variance = th.exp(model_log_variance)
+            assert model_output.shape == (B, C * 2, *x.shape[2:])
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            # The model_var_values is [-1, 1] for [min_var, max_var].
+            frac = (model_var_values + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
         else:
             model_variance, model_log_variance = {
                 # for fixedlarge, we set the initial (log-)variance like so
@@ -418,6 +420,87 @@ class GaussianDiffusion:
             "extra": extra,
         }
 
+    def p_all_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+        """
+        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
+        the initial x, x_0.
+        :param model: the model, which takes a signal and a batch of timesteps
+                      as input.
+        :param x: [B, TN, C, P, P]
+        :param t: [B, T]
+        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample. Applies before
+            clip_denoised.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict with the following keys:
+                 - 'mean': the model mean output.
+                 - 'variance': the model variance output.
+                 - 'log_variance': the log of 'variance'.
+                 - 'pred_xstart': the prediction for x_0.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+            
+        t_expanded = expand_timesteps_like_patches(x, t)
+        model_output = model(x, **model_kwargs)
+        if isinstance(model_output, tuple):
+            model_output, extra = model_output
+        else:
+            extra = None
+
+        if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+            B, TN, C2, P, P = model_output.shape
+            C = C2 // 2
+            model_output, model_var_values = th.split(model_output, C, dim=2)
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t_expanded, x.shape)
+            max_log = _extract_into_tensor(np.log(self.betas), t_expanded, x.shape)
+            # The model_var_values is [-1, 1] for [min_var, max_var].
+            frac = (model_var_values + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
+        else:
+            model_variance, model_log_variance = {
+                # for fixedlarge, we set the initial (log-)variance like so
+                # to get a better decoder log likelihood.
+                ModelVarType.FIXED_LARGE: (
+                    np.append(self.posterior_variance[1], self.betas[1:]),
+                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
+                ),
+                ModelVarType.FIXED_SMALL: (
+                    self.posterior_variance,
+                    self.posterior_log_variance_clipped,
+                ),
+            }[self.model_var_type]
+
+            model_variance = _extract_into_tensor(model_variance, t_expanded, x.shape)
+            model_log_variance = _extract_into_tensor(model_log_variance, t_expanded, x.shape)
+
+        def process_xstart(x):
+            if denoised_fn is not None:
+                x = denoised_fn(x)
+            if clip_denoised:
+                return x.clamp(-1, 1)
+            return x
+
+        if self.model_mean_type == ModelMeanType.START_X:
+            pred_xstart = process_xstart(model_output)
+        else:
+            pred_xstart = process_xstart(
+                self._predict_all_xstart_from_eps(x_t=x, t=t_expanded, eps=model_output)
+            )
+        model_mean, _, _ = self.q_all_posterior_mean_variance(x_start=pred_xstart, x_t_all=x, t=t_expanded)
+
+        assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
+            "extra": extra,
+        }
+
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
         return (
@@ -429,6 +512,37 @@ class GaussianDiffusion:
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart
         ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+
+    def _predict_all_xstart_from_eps(self, x_t, t, eps):
+        """
+        Predict x_0 from x_t and eps for patch-level input.
+        
+        Args:
+            x_t: (B, T*N, C, P, P)
+            t:   (B, T)
+            eps: (B, T*N, C, P, P)
+        """
+        assert x_t.shape == eps.shape
+        t_expanded = expand_timesteps_like_patches(x_t, t)
+        coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t_expanded, x_t.shape)
+        coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t_expanded, x_t.shape)
+        return coeff1 * x_t - coeff2 * eps
+
+
+    def _predict_all_eps_from_xstart(self, x_t, t, pred_xstart):
+        """
+        Predict eps from x_t and predicted x_0, for patch-level input.
+
+        Args:
+            x_t: (B, T*N, C, P, P)
+            t:   (B, T)
+            pred_xstart: (B, T*N, C, P, P)
+        """
+        assert x_t.shape == pred_xstart.shape
+        t_expanded = expand_timesteps_like_patches(x_t, t)
+        coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t_expanded, x_t.shape)
+        coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t_expanded, x_t.shape)
+        return (coeff1 * x_t - pred_xstart) / coeff2
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
@@ -793,27 +907,30 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
+        import pdb;pdb.set_trace()
         true_mean, _, true_log_variance_clipped = self.q_all_posterior_mean_variance(
             x_start=x_start, x_t_all=x_t, t=t
         )
-        import pdb;pdb.set_trace()
-        out = self.p_mean_variance(
+        out = self.p_all_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
         kl = normal_kl(
             true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
         )
-        kl = mean_flat(kl) / np.log(2.0)
+        # kl = mean_flat(kl) / np.log(2.0)
+        kl = mean_flat(kl.reshape(kl.shape[0]*kl.shape[1],-1)) / np.log(2.0)
 
+        x_start_expanded = to_patch_seq(x_start.unsqueeze(1).expand(-1,t.shape[1],-1,-1,-1), x_t.shape[3])
         decoder_nll = -discretized_gaussian_log_likelihood(
-            x_start, means=out["mean"], log_scales=0.5 * out["log_variance"]
+            x_start_expanded, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
-        assert decoder_nll.shape == x_start.shape
-        decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        assert decoder_nll.shape == x_start_expanded.shape
+        # decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        decoder_nll = mean_flat(decoder_nll.reshape(decoder_nll.shape[0]*decoder_nll.shape[1],-1)) / np.log(2.0)
 
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
-        output = th.where((t == 0), decoder_nll, kl)
+        output = th.where((expand_timesteps_like_patches(x_t,t).reshape(x_t.shape[0]*x_t.shape[1]) == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
     def generate_diffusion_noise_sequence(self, x_start, t):
@@ -899,7 +1016,7 @@ class GaussianDiffusion:
                 model_output, model_var_values = th.split(model_output, C, dim=2)  # Split along channel dim  
                 
                 # 构建 frozen_out：均值部分不参与梯度更新
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+                frozen_out = th.cat([model_output.detach(), model_var_values], dim=2)
 
                 # 计算 VB Loss
                 terms["vb"] = self._vb_terms_bpd(
@@ -911,6 +1028,7 @@ class GaussianDiffusion:
                 )["output"]
 
                 if self.loss_type == LossType.RESCALED_MSE:
+                    raise NotImplementedError("没看懂这是啥")
                     terms["vb"] *= self.num_timesteps / 1000.0
             
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, H, W)
