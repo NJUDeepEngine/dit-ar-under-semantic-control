@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 import enum
 
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq, timesteps_padding
 
 
 def mean_flat(tensor):
@@ -304,37 +304,30 @@ class GaussianDiffusion:
         Args:
             x_start: (B, C, H, W) clean image
             x_t_all: (B, TN, C, H, W) noised patches at all t
-            noise: (B, TN, C, H, W) optionally the noise added to x_start to get x_t_all
 
         Returns:
             posterior_mean: (B, TN, C, H, W)
             posterior_variance: (B, TN, C, H, W)
             posterior_log_variance: (B, TN, C, H, W)
         """
-        B, TN, C, H, W = x_t_all.shape
+        B, TN, C, P, P_ = x_t_all.shape
+        _, _, H, W = x_start.shape
         device = x_t_all.device
-        T = max(t).item()
+        T = t.shape[1]
         assert TN % T == 0, "TN must be divisible by num_timesteps"
         N_patch = TN // T
 
-        # Step 1: Expand x_start to [B, TN, C, H, W]
-        x_start_expanded = x_start.unsqueeze(1).expand(B, TN, C, H, W)
+        # Step 1: Expand x_start to [B, TN, C, P, P]
+        x_start_expanded = to_patch_seq(x_start.unsqueeze(1).expand(B, T, C, H, W), P)
 
         # Step 2: Construct time indices t: [T-1]*K + [T-2]*K + ... + [0]*K
-        t_all = []  # list of per-sample (TN_i,) tensors
-        for i in range(B):
-            Ti = t[i].item()
-            t_i = th.arange(Ti - 1, -1, -1, device=device).repeat_interleave(N_patch)  # (Ti * N_patch,)
-            pad_len = (T - Ti) * N_patch
-            t_i = th.cat([t_i, th.zeros(pad_len, dtype=t_i.dtype, device=device)])  # pad with t=0
-            t_all.append(t_i)
-        t = th.stack(t_all, dim=0)  # (B, TN)
+        t = t.repeat_interleave(N_patch, dim=1)  # (B, TN)
 
         # Step 3: Compute posterior mean
-        coef1 = _extract_into_tensor(self.posterior_mean_coef1, t, x_t_all.shape)  # (B, TN, C, H, W)
+        coef1 = _extract_into_tensor(self.posterior_mean_coef1, t, x_t_all.shape)  # (B, TN, C, P, P)
         coef2 = _extract_into_tensor(self.posterior_mean_coef2, t, x_t_all.shape)
 
-        posterior_mean = coef1 * x_start_expanded + coef2 * x_t_all  # (B, TN, C, H, W)
+        posterior_mean = coef1 * x_start_expanded + coef2 * x_t_all  # (B, TN, C, P, P)
 
         posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t_all.shape)
         posterior_log_variance_clipped = _extract_into_tensor(
@@ -800,9 +793,10 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
-        true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
-            x_start=x_start, x_t=x_t, t=t
+        true_mean, _, true_log_variance_clipped = self.q_all_posterior_mean_variance(
+            x_start=x_start, x_t_all=x_t, t=t
         )
+        import pdb;pdb.set_trace()
         out = self.p_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
@@ -822,46 +816,39 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    #！！！生成扩散噪声序列
     def generate_diffusion_noise_sequence(self, x_start, t):
         """
-        对每个样本，根据其对应的时间步 t[i]，生成从 x_0 到 x_t[i] 的 noised 图像序列，
-        并将其 reverse 成 [x_t, ..., x_0] 的顺序，左侧填0以对齐。
-
+        扩散过程从 x_0 生成每个指定时间步的 noised 图像。
+        
         Args:
-            x_start: (B, C, H, W)
-            t: (B,) - 每个样本的最大时间步（int Tensor）
+            x_start: (B, C, H, W) - 原始图像 x_0
+            t: (B, T) - 每个样本需要生成的原始 1000 步时间戳；若为 -1 表示填全 0 图像（EOS）
 
         Returns:
-            x_t_all: (B, T_max+1, C, H, W) - 每个样本右对齐有效序列并反转，左侧全0
+            x_t_all: (B, T, C, H, W) - 每个样本指定时间步下的 noised 图像（或全 0）
         """
         B, C, H, W = x_start.shape
+        T_steps = t.shape[1]
         device = x_start.device
-        T_max = t.max().item()
 
-        x_t_all = th.zeros(B, T_max + 1, C, H, W, device=device)
+        # 预分配输出 (B, T, C, H, W)
+        x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
 
-        # 对每个样本单独处理
         for b in range(B):
-            t_b = t[b].item()
             x_t = x_start[b]  # (C, H, W)
-            seq = [x_t]  # x_0
-
-            # 从 x_1 到 x_t
-            for step in range(1, t_b + 1):
+            for idx in range(T_steps):
+                cur_step = t[b, idx].item()
+                if cur_step == 0:
+                    x_t_all[b, idx] = x_t
+            for step in range(1, self.num_timesteps + 1):
                 noise = th.randn_like(x_t)
                 sqrt_alpha = self.sqrt_alphas[step - 1]
                 sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[step - 1]
-
                 x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
-                seq.append(x_t)
-
-            # 反转为 [x_t, ..., x_0]
-            seq = seq[::-1]  # list of (C, H, W)
-            seq_tensor = th.stack(seq, dim=0)  # (t_b+1, C, H, W)
-
-            # 放入 x_t_all 右侧靠齐
-            x_t_all[b, :t_b + 1] = seq_tensor
+                for idx in range(T_steps):
+                    cur_step = t[b, idx].item()
+                    if cur_step == step:
+                        x_t_all[b, idx] = x_t
 
         return x_t_all
 
@@ -870,20 +857,21 @@ class GaussianDiffusion:
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
         :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
+        :param t: [N x T], a sequence of timesteps onuse for each picture.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
-        
         if model_kwargs is None:
             model_kwargs = {}
         assert t is not None
         if isinstance(t, int):
             t = th.tensor([t] * x_start.shape[0], device=x_start.device)
-            
+        if len(t.shape) == 1:
+            wrapped_t = timestep_padding(t)['patched_timesteps']
+
         if noise is None:
             x_t_all = self.generate_diffusion_noise_sequence(x_start, t=t)
         else:
@@ -902,12 +890,28 @@ class GaussianDiffusion:
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w)
             
+            
             #这是预测均值和方差时，此时通道数由3变为6
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-                raise NotImplementedError(self.loss_type)
+            if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+                B, TN, C2, H, W = model_output.shape
+                assert C2 % 2 == 0, "Expecting 2C channels when predicting variance"
+                C = C2 // 2
+                model_output, model_var_values = th.split(model_output, C, dim=2)  # Split along channel dim  
+                
+                # 构建 frozen_out：均值部分不参与梯度更新
+                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+
+                # 计算 VB Loss
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out: r,
+                    x_start=x_start,
+                    x_t=x_t_all,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+
+                if self.loss_type == LossType.RESCALED_MSE:
+                    terms["vb"] *= self.num_timesteps / 1000.0
             
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, H, W)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
@@ -916,8 +920,8 @@ class GaussianDiffusion:
                 )[0]         
             elif self.model_mean_type == ModelMeanType.START_X:
                 # 先扩展成所有时间步
-                x_start_all = x_start.unsqueeze(1).expand(-1, self.num_timesteps, -1, -1, -1)  # (B, T, C, H, W)
-                x_start_all = to_patch_seq(x_start_all, model.patch_size)  # (B, TN, C, H, W)
+                x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
+                x_start_all = to_patch_seq(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
 
                 # 添加 eos patch
                 target = th.cat([
@@ -925,7 +929,9 @@ class GaussianDiffusion:
                     eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
                 ], dim=1)  # (B, TN, C, H, W)
             elif self.model_mean_type == ModelMeanType.EPSILON:
-                noise = to_patch_seq(noise, model.patch_size)
+                x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
+                x_start_all = to_patch_seq(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
+                noise = x_t_all - x_start_all
                 target = th.cat([
                     noise[:, 1:],        # (B, T-1, C, H, W)
                     eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
@@ -933,11 +939,7 @@ class GaussianDiffusion:
             
             assert model_output.shape == target.shape
 
-            # 构造 mask: (B, TN) = 每个样本的有效时间步 t[i] × N_patch
-            N_patch = TN // t.max().item()
-            device = model_output.device
-            t_patch = t * N_patch  # 每个样本的有效 patch 数 (B,)
-            mask = th.arange(TN, device=device).unsqueeze(0) < t_patch.unsqueeze(1)  # (B, TN)
+            mask = (t != -1)
 
             # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
             mask = mask.reshape(B * TN, 1, 1, 1).float()

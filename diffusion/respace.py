@@ -7,6 +7,7 @@ import numpy as np
 import torch as th
 
 from .gaussian_diffusion import GaussianDiffusion
+from .diffusion_utils import timesteps_padding 
 
 
 def space_timesteps(num_timesteps, section_counts):
@@ -100,16 +101,15 @@ class SpacedDiffusion(GaussianDiffusion):
     #！！！新增
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         # 将缩减时间步映射回原始时间步
-        if t is None:
-            t = len(self.timestep_map) - 1
-        # if isinstance(t, int):
-        #     mapper_t = self.timestep_map[t]
+        assert t is not None and isinstance(t, th.Tensor)
+        mapper = lambda t : np.linspace(0, 999, t + 1).round().astype(int).tolist()
+        wrapped_t = timesteps_padding(t=t, mapper=mapper)
         # else:
         #     device = t.device
         #     mapped_t = th.tensor([self.timestep_map[int(time.item())] for time in t], device=device, dtype=t.dtype)
         
         # 调用父类 training_losses，传入映射后的时间步
-        return super().training_losses(model, x_start, t, model_kwargs=model_kwargs, noise=noise)
+        return super().training_losses(model, x_start, wrapped_t['patched_timesteps'], model_kwargs=model_kwargs, noise=noise)
 
     def _wrap_model(self, model):
         if isinstance(model, _WrappedModel):
@@ -121,6 +121,7 @@ class SpacedDiffusion(GaussianDiffusion):
     def _scale_timesteps(self, t):
         # Scaling is done by the wrapped model.
         return t
+
 
 
 class _WrappedModel:
