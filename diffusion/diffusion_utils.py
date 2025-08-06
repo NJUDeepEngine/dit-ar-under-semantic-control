@@ -144,3 +144,67 @@ def from_patch_seq(patch_seq, eos_token, patch_size, patch_num, out_channels):
 
     imgs = th.stack(imgs, dim=0)  # (B, C, H, W)
     return imgs
+
+def timesteps_padding(t, mapper = None) -> dict:
+    """
+    对每张图像，根据其当前时间步 t_i，构建从 1000 步压缩到 t_i+1 的映射表，
+    并将 [t_i, ..., 0] 映射回原始 1000 步空间下的时间戳。
+
+    Args:
+        t (Tensor): shape (B,) 当前 batch 每张图像的时间步数（压缩后）
+        mapper: 映射方式
+
+    Returns:
+        dict:
+            - list_timesteps: List[List[int]]，每张图像的原始时间戳序列（降序）
+            - patched_timesteps: Tensor (B, max_t+1)，右对齐，左边填0
+    """
+    batch_size = t.shape[0]
+    device = t.device
+    max_t = t.max().item()
+
+    list_timesteps = []
+    patched_timesteps = []
+
+    if mapper is None:
+        mapper = lambda x: x
+
+    for i in range(batch_size):
+        t_i = t[i].item()
+
+        mapped = [mapper(t_i)[j] for j in range(t_i, -1, -1)]  # 反向
+
+        list_timesteps.append(mapped)
+
+        # 3. 右对齐，左边补0，使所有样本同长度
+        pad_len = max_t + 1 - len(mapped)
+        padded = [-1] * pad_len + mapped
+        patched_timesteps.append(padded)
+
+    patched_timesteps = th.tensor(patched_timesteps, dtype=th.long, device=device)
+
+    return {
+        "list_timesteps": list_timesteps,
+        "patched_timesteps": patched_timesteps
+    }
+
+def expand_timesteps_like_patches(x, t):
+    """
+    Expand timestep tensor t (B, T) into (B, T*N) to match x: (B, T*N, C, P, P)
+
+    Args:
+        x: torch.Tensor of shape (B, T*N, C, P, P)
+        t: torch.LongTensor of shape (B, T)
+
+    Returns:
+        t_expanded: torch.LongTensor of shape (B, T*N)
+    """
+    B, TN, _, _, _ = x.shape
+    B_t, T = t.shape
+    assert B == B_t, "Batch size mismatch"
+    assert TN % T == 0, "Patch count not divisible by timestep count"
+    N = TN // T
+
+    # Expand t: (B, T) → (B, T, N) → (B, T*N)
+    t_expanded = t.unsqueeze(2).expand(B, T, N).reshape(B, TN)
+    return t_expanded
