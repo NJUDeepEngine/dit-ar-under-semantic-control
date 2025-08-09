@@ -96,7 +96,7 @@ def to_patch_seq(x, patch_size):
     h, w = H // patch_size, W // patch_size
 
     x = x.reshape(B, T, C, h, patch_size, w, patch_size)  # 分 patch
-    x = x.permute(0, 1, 3, 5, 2, 4, 6)  # B, T, h, w, C, p, p
+    x = x.permute(0, 1, 3, 5, 2, 4, 6).contiguous()  # B, T, h, w, C, p, p
     x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
     return x
 
@@ -176,7 +176,7 @@ def timesteps_padding(t, mapper = None) -> dict:
 
         list_timesteps.append(mapped)
 
-        # 3. 右对齐，左边补0，使所有样本同长度
+        # 3. 右对齐，左边补-1，使所有样本同长度
         pad_len = max_t + 1 - len(mapped)
         padded = [-1] * pad_len + mapped
         patched_timesteps.append(padded)

@@ -9,7 +9,7 @@ import math
 import numpy as np
 import torch as th
 import enum
-
+import pdb
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq, timesteps_padding, expand_timesteps_like_patches
 
 
@@ -907,7 +907,7 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
-        import pdb;pdb.set_trace()
+        import pdb;#pdb.set_trace()
         true_mean, _, true_log_variance_clipped = self.q_all_posterior_mean_variance(
             x_start=x_start, x_t_all=x_t, t=t
         )
@@ -950,7 +950,7 @@ class GaussianDiffusion:
 
         # 预分配输出 (B, T, C, H, W)
         x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
-
+        ###todo to turn beta to new betas
         for b in range(B):
             x_t = x_start[b]  # (C, H, W)
             for idx in range(T_steps):
@@ -1007,7 +1007,7 @@ class GaussianDiffusion:
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w)
             
-            
+            """
             #这是预测均值和方差时，此时通道数由3变为6
             if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
                 B, TN, C2, H, W = model_output.shape
@@ -1030,13 +1030,15 @@ class GaussianDiffusion:
                 if self.loss_type == LossType.RESCALED_MSE:
                     raise NotImplementedError("没看懂这是啥")
                     terms["vb"] *= self.num_timesteps / 1000.0
-            
-            eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, H, W)
+            """
+            eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, p, p)
+            """
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
                     x_start=x_start, x_t=x_t_all, t=t
-                )[0]         
-            elif self.model_mean_type == ModelMeanType.START_X:
+                )[0]   
+            """      
+            if self.model_mean_type == ModelMeanType.START_X:
                 # 先扩展成所有时间步
                 x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
                 x_start_all = to_patch_seq(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
@@ -1056,9 +1058,9 @@ class GaussianDiffusion:
                 ], dim=1)             
             
             assert model_output.shape == target.shape
-
+            #pdb.set_trace()
             mask = (t != -1)
-
+            mask = mask.repeat_interleave(TN//mask.shape[1], dim=1)
             # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
             mask = mask.reshape(B * TN, 1, 1, 1).float()
             # Merge B and T to treat each patch as一个样本点
