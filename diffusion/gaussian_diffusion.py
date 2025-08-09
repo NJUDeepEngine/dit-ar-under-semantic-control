@@ -935,7 +935,7 @@ class GaussianDiffusion:
 
     def generate_diffusion_noise_sequence(self, x_start, t):
         """
-        扩散过程从 x_0 生成每个指定时间步的 noised 图像。
+        扩散过程从 x_0 生成每个指定时间步的 noised 图像及其对应噪声。
         
         Args:
             x_start: (B, C, H, W) - 原始图像 x_0
@@ -943,6 +943,7 @@ class GaussianDiffusion:
 
         Returns:
             x_t_all: (B, T, C, H, W) - 每个样本指定时间步下的 noised 图像（或全 0）
+            noise_all: (B, T, C, H, W) - 对应的噪声序列（ε_t）
         """
         B, C, H, W = x_start.shape
         T_steps = t.shape[1]
@@ -950,24 +951,32 @@ class GaussianDiffusion:
 
         # 预分配输出 (B, T, C, H, W)
         x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
-        ###todo to turn beta to new betas
+        noise_all = th.zeros_like(x_t_all)  # 用于存储噪声的张量
+
         for b in range(B):
             x_t = x_start[b]  # (C, H, W)
             for idx in range(T_steps):
                 cur_step = t[b, idx].item()
                 if cur_step == 0:
-                    x_t_all[b, idx] = x_t
+                    x_t_all[b, idx] = x_t  # 处理 t=0 对应的 x_0
+
+            # 从时间步1到num_timesteps生成噪声序列
             for step in range(1, self.num_timesteps + 1):
-                noise = th.randn_like(x_t)
+                noise = th.randn_like(x_t)  # 生成当前时间步的噪声
                 sqrt_alpha = self.sqrt_alphas[step - 1]
                 sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[step - 1]
+
                 x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
+
+                # 存储噪声
                 for idx in range(T_steps):
                     cur_step = t[b, idx].item()
                     if cur_step == step:
                         x_t_all[b, idx] = x_t
+                        noise_all[b, idx] = noise  # 存储对应的噪声
 
-        return x_t_all
+        return x_t_all, noise_all  # 返回加噪图像序列和噪声序列
+
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
@@ -990,7 +999,7 @@ class GaussianDiffusion:
             wrapped_t = timestep_padding(t)['patched_timesteps']
 
         if noise is None:
-            x_t_all = self.generate_diffusion_noise_sequence(x_start, t=t)
+            x_t_all,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
         else:
             raise NotImplementedError("noise is not None, not implemented yet")
             # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
@@ -1049,11 +1058,9 @@ class GaussianDiffusion:
                     eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
                 ], dim=1)  # (B, TN, C, H, W)
             elif self.model_mean_type == ModelMeanType.EPSILON:
-                x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
-                x_start_all = to_patch_seq(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
-                noise = x_t_all - x_start_all
+                noise_all = to_patch_seq(noise_all, model.module.patch_size) 
                 target = th.cat([
-                    noise[:, 1:],        # (B, T-1, C, H, W)
+                    noise_all[:, 1:],        # (B, T-1, C, H, W)
                     eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
                 ], dim=1)             
             
