@@ -4,3 +4,15 @@ __pycache__/
 *.pyc
 *.log
 *.tmp
+--data-path
+--max_gen_len
+--model
+--nnodes=1
+--nproc_per_node=2
+--num-classes
+--resume-ckpt
+--resume-epoch
+--resume-step
+--use-wandb
+--wandb-name
+--wandb-project
