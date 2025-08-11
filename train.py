@@ -8,6 +8,8 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
+import wandb
+import pdb
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -26,6 +28,7 @@ from time import time
 import argparse
 import logging
 import os
+from torchvision.utils import save_image
 
 from models import DiT_models
 from diffusion import create_diffusion,to_patch_seq,from_patch_seq
@@ -115,6 +118,7 @@ def main(args):
 
     # Setup DDP:
     dist.init_process_group("nccl")
+    #pdb.set_trace()
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
@@ -135,7 +139,20 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
         logger = create_logger(None)
+    
+    wandb_run = None
+    if args.use_wandb and dist.get_rank() == 0:
+        # 小心：如果你想让这次 run 续写到同一个 W&B run（很少需要），传入 id + resume
+        init_kwargs = dict(
+            project=args.wandb_project,
+            entity=args.wandb_team,
+            name=args.wandb_name,
+            config=vars(args),
+        )
+        if args.wandb_id is not None:
+            init_kwargs.update(id=args.wandb_id, resume=args.wandb_resume)
 
+        wandb_run = wandb.init(**init_kwargs)
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
@@ -146,13 +163,61 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    model = DDP(model.to(device), device_ids=[device])
+    diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000)  # default: 1000 steps, linear noise schedule
+    vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
+    #vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    
+    # Variables for monitoring/logging purposes:
+    train_steps = 0
+    log_steps = 0
+    running_loss = 0
+    start_time = time()
+    start_epoch = 0
+
+    # ===== Resume from checkpoint (optional) =====
+    if args.resume_ckpt is not None:
+        map_loc = {"cuda:%d" % 0: "cuda:%d" % device}  # 兼容跨卡加载
+        ckpt = torch.load(args.resume_ckpt, map_location=lambda storage, loc: storage.cuda(device))
+        model.module.load_state_dict(ckpt["model"])
+        ema.load_state_dict(ckpt["ema"])
+        opt.load_state_dict(ckpt["opt"])
+
+        # 恢复步数/epoch（如果老 ckpt 没存，就从文件名猜一把）
+        train_steps = int(ckpt.get("train_steps", 0))
+        start_epoch = int(ckpt.get("epoch", 0))
+        if args.resume_epoch is not None:
+            start_epoch = int(args.resume_epoch)
+        if args.resume_step is not None:
+            train_steps = int(args.resume_step)
+
+        if train_steps == 0:
+            # 例如 checkpoints/0001000.pt -> 1000
+            try:
+                import re
+                fname = os.path.basename(args.resume_ckpt)
+                m = re.search(r"(\d+)\.pt$", fname)
+                if m:
+                    train_steps = int(m.group(1))
+            except Exception:
+                pass
+
+        if dist.get_rank() == 0:
+            logger.info(f"Resumed from {args.resume_ckpt} (epoch={start_epoch}, train_steps={train_steps})")
+            if wandb_run is not None:
+                wandb.run.summary["resumed_from_ckpt"] = args.resume_ckpt
+                wandb.run.summary["resumed_from_epoch"] = start_epoch
+                wandb.run.summary["resumed_from_step"] = train_steps
+    if wandb_run is not None:
+        # 用一个统一的 step 作为横轴
+        wandb.define_metric("global_step")
+        wandb.define_metric("train/*", step_metric="global_step")
+        wandb.define_metric("val/*",   step_metric="global_step")
+
 
     # Setup data:
     transform = transforms.Compose([
@@ -183,75 +248,105 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    # 只在不恢复时初始化 EMA；恢复时保留 ckpt 里的 EMA
+    if args.resume_ckpt is None:
+        update_ema(ema, model.module, decay=0)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    #train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
-
+    
+        # 只取一次数据集中的一个batch（即一张图片）
+    x, y = next(iter(loader))  # 从loader中取一个batch
+    save_image(x, 'x_started.png')
+    #print(x.shape)
+    x_origin = x.to(device)
+    y_origin = y.to(device)
+    #print(x.shape)
+    #print(y)
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
+    for epoch in range(start_epoch, args.epochs):
+            sampler.set_epoch(epoch)
+            logger.info(f"Beginning epoch {epoch}...")
+            x=x_origin.clone()
+            y=y_origin.clone( )
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
+                # 将输入图像映射到潜在空间并归一化
+                #print(x.shape)
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            rand_t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()  # 先采样一个随机整数
+                check_x=vae.decode(x / 0.18215).sample
+                #save_image(check_x,'check_x.png')
+                #save_image(check_x,'norm_x.png',normalize=True, value_range=(-1, 1))
+            #print("after vae:",x.shape)
+            rand_t = 100  # 随机整数采样
             t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)  # 用该值填充整个batch
-            #t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            #t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()
+
             model_kwargs = dict(y=y)
-            #def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
+            # 计算当前batch的损失
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
+
             opt.zero_grad()
             loss.backward()
             opt.step()
             update_ema(ema, model.module)
 
-            # Log loss values:
+            # 记录损失值
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+
             if train_steps % args.log_every == 0:
-                # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
+
+                # 对所有进程减少损失历史
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
+
+                # W&B 记录（可选）
+                if dist.get_rank() == 0 and wandb_run is not None:
+                    wandb.log({
+                        "train/loss_avg": float(avg_loss),
+                        "train/steps_per_sec": float(steps_per_sec),
+                        "global_step": train_steps
+                    }, step=train_steps)
+
+                # 重置监控变量
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
+            # 保存模型检查点（可选）
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "train_steps": train_steps,
+                        "epoch": epoch
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    if wandb_run is not None:
+                        wandb.run.summary["last_ckpt_path"] = checkpoint_path
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-
+    if wandb_run is not None and dist.get_rank() == 0:
+        wandb.run.summary["final_train_steps"] = train_steps
+        wandb.finish()
     logger.info("Done!")
     cleanup()
 
@@ -261,17 +356,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-S/8")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=16)
+    parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--global-batch-size", type=int, default=32)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--ckpt-every", type=int, default=100)
     parser.add_argument("--max_gen_len", type=int, default=1000)
+    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="your_project")
+    parser.add_argument("--wandb-team",type=str,default="nju-ics")
+    parser.add_argument("--wandb-name", type=str, default=None)
+    parser.add_argument("--wandb-id", type=str, default=None, help="Set to resume the same W&B run id")
+    parser.add_argument("--wandb-resume", type=str, choices=["never","allow","must"], default="never")   
+    parser.add_argument("--resume-ckpt", type=str, default=None, help="Path to a checkpoint to resume from")
+    parser.add_argument("--resume-epoch", type=int, default=None, help="Resume from a specific epoch")
+    parser.add_argument("--resume-step", type=int, default=None, help="Resume from a specific step")
     args = parser.parse_args()
     main(args)
 """
@@ -283,5 +387,4 @@ train.py \
 --data-path /path/to/imagenet/train \
 --num-classes 10 \
 --max_gen_len 1000
-
 """

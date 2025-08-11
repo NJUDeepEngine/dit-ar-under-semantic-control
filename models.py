@@ -121,7 +121,7 @@ class DiTBlock(nn.Module):
         B, T, _ = x.shape
         causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (B, T, T)
-        print(causal_mask.shape)  # 应为 [B, T, T]
+        #print(causal_mask.shape)  # 应为 [B, T, T]
         x_1=modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa),
@@ -168,7 +168,7 @@ class DiT(nn.Module):
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
-        learn_sigma=True,
+        learn_sigma=False,
         max_gen_len=1000  # Maximum length of generated sequence
     ):
         super().__init__()
@@ -262,32 +262,38 @@ class DiT(nn.Module):
     
     def forward_with_cfg(self, x, y, is_training=True, cfg_scale=1.0):
         """
-        Classifier-Free Guidance forward.
-        Args:
-            x: (B, LEN, C, P, P)
-            y: (B,)
-            cfg_scale: float
-        Returns:
-            (B, LEN, C, P, P)
+        x: (B, LEN, C, P, P)    # 你在推理里已经把 z 做了 to_patch_seq -> start_seq
+        y: (B,)
+        返回: (B, LEN or 1, C, P, P) 与 self.forward 对齐
         """
-        assert x.shape[0] % 2 == 0, "Batch size must be even for CFG"
+        B = x.shape[0]
+        assert B % 2 == 0, "Batch size must be even for CFG (cond+uncond)"
 
-        half = x[:len(x) // 2]        # (B/2, LEN, C, P, P)
-        half_y = y[:len(y) // 2]      # (B/2,)
-        combined = torch.cat([half, half], dim=0)             # (B, LEN, C, P, P)
-        y_combined = torch.cat([half_y, torch.zeros_like(half_y)], dim=0)  # (B,)
+        # 拆 cond / 构造 uncond
+        half_x = x[: B // 2]       # (B/2, LEN, C, P, P)
+        half_y = y[: B // 2]       # (B/2,)
 
-        model_out = self.forward(combined, y_combined, is_training=is_training)  # (B, LEN, C, P, P)
+        x_comb = torch.cat([half_x, half_x], dim=0)                # (B, LEN, C, P, P)
+        # 无条件标签（通常用 num_classes 作为 null id；若你有别的定义，也可在外面传入）
+        null_id = getattr(self.y_embedder, "num_classes", None)
+        assert null_id is not None, "LabelEmbedder 里要有 num_classes 作为 null class id"
+        y_null = torch.full_like(half_y, fill_value=null_id)
+        y_comb = torch.cat([half_y, y_null], dim=0)                # (B,)
 
-        # Split channels
-        eps, rest = model_out[:, :, :3], model_out[:, :, 3:]  # (B, LEN, 3, P, P), (B, LEN, rest, P, P)
-        cond_eps, uncond_eps = eps.chunk(2, dim=0)  # (B/2, LEN, 3, P, P)
-        guided_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        # 走一次模型（和普通 forward 一样）
+        out = self.forward(x_comb, y_comb, is_training=is_training)  # 训练返回 (B,LEN,C,P,P)；推理返回 (B,1,C,P,P)
 
-        # Duplicate to match batch size (optional)
-        eps = torch.cat([guided_eps, guided_eps], dim=0)  # (B, LEN, 3, P, P)
-        out = torch.cat([eps, rest], dim=2)  # (B, LEN, C, P, P)
+        # 按 batch 维拆 cond/uncond
+        cond_out, uncond_out = out.chunk(2, dim=0)  # 与 forward 的输出形状一致
+
+        # 对**所有通道**做 CFG（不要再 :3）
+        guided = uncond_out + cfg_scale * (cond_out - uncond_out)
+
+        # 为了兼容你后续逻辑，很多人会把 guided 复制一份拼回 B 的 batch，
+        # 也可以只返回 guided（B/2, ...）。这里保持 B 不变：
+        out = torch.cat([guided, guided], dim=0)
         return out
+
 
 
 
