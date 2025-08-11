@@ -6,7 +6,7 @@
 import torch as th
 import numpy as np
 
-
+import pdb
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
     Compute the KL divergence between two gaussians.
@@ -100,11 +100,12 @@ def to_patch_seq(x, patch_size):
     x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
     return x
 
-def from_patch_seq(patch_seq, eos_token, patch_size, patch_num, out_channels):
+
+def from_patch_seq(patch_seq, eos_token=None, patch_size=4, patch_num=64, out_channels=4):
     """
     Args:
         patch_seq: (B, L, C, P, P)
-        eos_token: (C, P, P)
+        eos_token: (C, P, P) 或 None（None 时自动创建全 0 patch）
         patch_size: int
         patch_num: 每张图的 patch 数（int），必须是平方数（即 patch_num = h * w）
         out_channels: 通道数 C
@@ -112,17 +113,22 @@ def from_patch_seq(patch_seq, eos_token, patch_size, patch_num, out_channels):
         imgs: (B, C, H, W)，按有效 patch 解码的图像
     """
     B, L, C, P, _ = patch_seq.shape
-    assert patch_num <= L
-    assert P == patch_size
-    assert C == out_channels
+    assert patch_num <= L, f"patch_num({patch_num}) 必须 <= L({L})"
+    assert P == patch_size, f"patch_size({patch_size}) 与输入不匹配({P})"
+    assert C == out_channels, f"out_channels({out_channels}) 与输入不匹配({C})"
+
+    # 如果没有传 eos_token，则生成全 0 patch
+    if eos_token is None:
+        eos_token = th.zeros(C, P, P, device=patch_seq.device, dtype=patch_seq.dtype)
 
     h = w = int(patch_num ** 0.5)
     assert h * w == patch_num, "patch_num 必须是平方数"
 
     eos_mask = (patch_seq == eos_token.view(1, 1, C, P, P)).all(dim=(2, 3, 4))  # (B, L)
     eos_pos = eos_mask.float().argmax(dim=1)  # (B,)
+    pdb.set_trace()
     no_eos = (eos_mask.sum(dim=1) == 0)
-    eos_pos[no_eos] = patch_seq.shape[1]
+    eos_pos[no_eos] = patch_seq.shape[1]  # 没有 eos 时设为 L
 
     imgs = []
     for i in range(B):
@@ -137,9 +143,9 @@ def from_patch_seq(patch_seq, eos_token, patch_size, patch_num, out_channels):
             pad = th.zeros(pad_len, C, P, P, device=x.device, dtype=x.dtype)
             x = th.cat([pad, x], dim=0)  # pad 在前面补齐
 
-        x = x.view(h, w, C, P, P)        # (h, w, C, P, P)
-        x = x.permute(2, 0, 3, 1, 4)     # (C, h, P, w, P)
-        x = x.reshape(C, h * P, w * P)   # (C, H, W)
+        x = x.reshape(h, w, C, P, P)       # (h, w, C, P, P)
+        x = x.permute(2, 0, 3, 1, 4)       # (C, h, P, w, P)
+        x = x.reshape(C, h * P, w * P)     # (C, H, W)
         imgs.append(x)
 
     imgs = th.stack(imgs, dim=0)  # (B, C, H, W)
