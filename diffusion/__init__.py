@@ -31,7 +31,7 @@ def create_diffusion(
         use_timesteps=space_timesteps(diffusion_steps, timestep_respacing),
         betas=betas,
         model_mean_type=(
-            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
+            gd.ModelMeanType.PREVIOUS_X if not predict_xstart else gd.ModelMeanType.START_X
         ),
         model_var_type=(
             (

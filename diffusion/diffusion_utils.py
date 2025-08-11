@@ -100,6 +100,18 @@ def to_patch_seq(x, patch_size):
     x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
     return x
 
+def from_patch_seq_all(x, h, w):
+    B, TN, C, P, _ = x.shape
+    patch_h, patch_w = h // P, w // P
+    num_patch = patch_h * patch_w
+    T = TN // num_patch
+
+
+    # 1. 还原到 patch 网格
+    x = x.reshape(B, T, patch_h, patch_w, C, P, P)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    x = x.reshape(B, T, C, h, w)
+    return x
 
 def from_patch_seq(patch_seq, eos_token=None, patch_size=4, patch_num=64, out_channels=4):
     """
@@ -126,7 +138,6 @@ def from_patch_seq(patch_seq, eos_token=None, patch_size=4, patch_num=64, out_ch
 
     eos_mask = (patch_seq == eos_token.view(1, 1, C, P, P)).all(dim=(2, 3, 4))  # (B, L)
     eos_pos = eos_mask.float().argmax(dim=1)  # (B,)
-    pdb.set_trace()
     no_eos = (eos_mask.sum(dim=1) == 0)
     eos_pos[no_eos] = patch_seq.shape[1]  # 没有 eos 时设为 L
 
