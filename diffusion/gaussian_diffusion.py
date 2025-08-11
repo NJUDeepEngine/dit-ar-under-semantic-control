@@ -794,7 +794,7 @@ class GaussianDiffusion:
             except Exception:
                 pass
         if vae_path is not None:
-            vae = AutoencoderKL.from_pretrained(vae_path).to(device)
+            vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
         # 根据 num_patch 计算图像的高度和宽度
         H = int(P * (num_patch ** 0.5))  # 计算图像的高度
         W = H  # 由于是正方形图像，宽度和高度相同
@@ -1136,7 +1136,7 @@ class GaussianDiffusion:
         new_epoch_dir = self.get_new_epoch_directory(save_dir)
         print(f"Saving images to {new_epoch_dir}")
         # 加载 VAE 模型
-        vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
         
         # 遍历时间步 (T)
             # 遍历批次 B 和图像
