@@ -262,12 +262,12 @@ def main(args):
     
         # 只取一次数据集中的一个batch（即一张图片）
     x, y = next(iter(loader))  # 从loader中取一个batch
-    save_image(x, 'x_saved.png')
-    print(x.shape)
+    save_image(x, 'x_started.png')
+    #print(x.shape)
     x_origin = x.to(device)
     y_origin = y.to(device)
-    print(x.shape)
-    print(y)
+    #print(x.shape)
+    #print(y)
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
             sampler.set_epoch(epoch)
@@ -276,12 +276,12 @@ def main(args):
             y=y_origin.clone( )
             with torch.no_grad():
                 # 将输入图像映射到潜在空间并归一化
-                print(x.shape)
+                #print(x.shape)
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 check_x=vae.decode(x / 0.18215).sample
-                save_image(check_x,'check_x.png')
-                save_image(check_x,'norm_x.png',normalize=True, value_range=(-1, 1))
-            print("after vae:",x.shape)
+                #save_image(check_x,'check_x.png')
+                #save_image(check_x,'norm_x.png',normalize=True, value_range=(-1, 1))
+            #print("after vae:",x.shape)
             rand_t = 100  # 随机整数采样
             t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)  # 用该值填充整个batch
 
