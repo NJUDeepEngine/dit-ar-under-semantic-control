@@ -1081,13 +1081,14 @@ class GaussianDiffusion:
         # 预分配输出 (B, T, C, H, W)
         x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
         noise_all = th.zeros_like(x_t_all)  # 用于存储噪声的张量
-
+        #pdb.set_trace()
         for b in range(B):
             x_t = x_start[b]  # (C, H, W)
             for idx in range(T_steps):
                 cur_step = t[b, idx].item()
                 if cur_step == 0:
                     x_t_all[b, idx] = x_t  # 处理 t=0 对应的 x_0
+                    
 
             # 从时间步1到num_timesteps生成噪声序列
             for step in range(1, self.num_timesteps + 1):
@@ -1103,8 +1104,60 @@ class GaussianDiffusion:
                     if cur_step == step:
                         x_t_all[b, idx] = x_t
                         noise_all[b, idx] = noise  # 存储对应的噪声
-
         return x_t_all, noise_all  # 返回加噪图像序列和噪声序列
+    from torchvision.utils import save_image, make_grid
+    from diffusers.models import AutoencoderKL  # 假设是用的 Huggingface 提供的 AutoencoderKL
+
+    # 获取最大的 epoch 目录，并创建新的目录
+    def get_new_epoch_directory(self,save_dir='./check_code'):
+        # 检查默认保存路径下的所有子目录
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)  # 如果目录不存在，先创建它
+        
+        # 获取所有子目录的名称（假设目录名都是整数）
+        subdirs = [d for d in os.listdir(save_dir) if os.path.isdir(os.path.join(save_dir, d))]
+        # 如果没有子目录，返回新的epoch为1
+        if not subdirs:
+            new_epoch = 1
+        else:
+            # 获取最大目录名并创建新目录
+            max_epoch = max([int(d) for d in subdirs])
+            new_epoch = max_epoch + 1
+        
+        # 创建新的epoch目录
+        new_epoch_dir = os.path.join(save_dir, str(new_epoch))
+        os.makedirs(new_epoch_dir, exist_ok=True)
+        
+        return new_epoch_dir
+
+    # 假设 x_t_all 和 noise_all 已经是 (B, T, 10, 10, C, H, W) 的形状
+    def save_generated_images(self,x_t_all, noise_all, device, save_dir='./check_code'):
+        # 获取新的 epoch 文件夹路径
+        new_epoch_dir = self.get_new_epoch_directory(save_dir)
+        print(f"Saving images to {new_epoch_dir}")
+        # 加载 VAE 模型
+        vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
+        
+        # 遍历时间步 (T)
+            # 遍历批次 B 和图像
+        print(x_t_all.shape)
+        for b in range(x_t_all.shape[0]):  # 遍历每个样本 B
+            for t in range(x_t_all.shape[1]):  # 遍历所有时间步的图像
+                    x_t = x_t_all[b, t]  # (C, H, W) 图像
+                    noise = noise_all[b, t]  # (C, H, W) 噪声图像                    
+                    # 将 x_t 经过 VAE 解码器
+                    x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
+                    # 保存图像 x_t
+                    save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png')
+
+                    # 可选：保存噪声图像，除非噪声不需要解码
+                    noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
+                    # 保存噪声图像
+                    save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png')
+        print(f"Saved image x_t and noise_ in {new_epoch_dir}")
+
+    # 使用方法：假设你传入了 x_t_all, noise_all, device
+    # save_generated_images(x_t_all, noise_all, device, save_dir='./check_code')
 
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
@@ -1133,7 +1186,7 @@ class GaussianDiffusion:
             raise NotImplementedError("noise is not None, not implemented yet")
             # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
 
-
+        self.save_generated_images(x_t_all, noise_all, x_start.device, save_dir='./check_code')
         x_t_all = to_patch_seq(x_t_all, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
         B, TN, C, H, W = x_t_all.shape

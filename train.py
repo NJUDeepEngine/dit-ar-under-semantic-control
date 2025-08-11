@@ -28,6 +28,7 @@ from time import time
 import argparse
 import logging
 import os
+from torchvision.utils import save_image
 
 from models import DiT_models
 from diffusion import create_diffusion,to_patch_seq,from_patch_seq
@@ -164,7 +165,8 @@ def main(args):
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[device])
     diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000)  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
+    #vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
@@ -257,46 +259,59 @@ def main(args):
     log_steps = 0
     running_loss = 0
     start_time = time()
-
+    
+        # 只取一次数据集中的一个batch（即一张图片）
+    x, y = next(iter(loader))  # 从loader中取一个batch
+    save_image(x, 'x_saved.png')
+    print(x.shape)
+    x_origin = x.to(device)
+    y_origin = y.to(device)
+    print(x.shape)
+    print(y)
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
+            sampler.set_epoch(epoch)
+            logger.info(f"Beginning epoch {epoch}...")
+            x=x_origin.clone()
+            y=y_origin.clone( )
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
+                # 将输入图像映射到潜在空间并归一化
+                print(x.shape)
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            rand_t = 200 # 先采样一个随机整数
+                check_x=vae.decode(x / 0.18215).sample
+                save_image(check_x,'check_x.png')
+                save_image(check_x,'norm_x.png',normalize=True, value_range=(-1, 1))
+            print("after vae:",x.shape)
+            rand_t = 100  # 随机整数采样
             t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)  # 用该值填充整个batch
-            #t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            #t = torch.randint(0, diffusion.num_timesteps, (1,), device=device).item()
+
             model_kwargs = dict(y=y)
-            #def training_losses(self, model, x_start, t=None, model_kwargs=None, noise=None):
+            # 计算当前batch的损失
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
+
             opt.zero_grad()
             loss.backward()
             opt.step()
             update_ema(ema, model.module)
 
-            # Log loss values:
+            # 记录损失值
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+
             if train_steps % args.log_every == 0:
-                # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
+
+                # 对所有进程减少损失历史
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                
-                # ⬇ 在这里追加 W&B 记录
+
+                # W&B 记录（可选）
                 if dist.get_rank() == 0 and wandb_run is not None:
                     wandb.log({
                         "train/loss_avg": float(avg_loss),
@@ -304,12 +319,12 @@ def main(args):
                         "global_step": train_steps
                     }, step=train_steps)
 
-                # Reset monitoring variables:
+                # 重置监控变量
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
+            # 保存模型检查点（可选）
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
@@ -323,7 +338,6 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    # ⬇ 在这里追加 W&B summary 记录
                     if wandb_run is not None:
                         wandb.run.summary["last_ckpt_path"] = checkpoint_path
                 dist.barrier()
