@@ -1108,8 +1108,7 @@ class GaussianDiffusion:
         for b in range(x_t_all.shape[0]):  # 遍历每个样本 B
             for t in range(x_t_all.shape[1]):  # 遍历所有时间步的图像
                 x_t = x_t_all[b, t]  # (C, H, W) 图像
-                noise = noise_all[b, t]  # (C, H, W) 噪声图像                    
-                pred_x = pred_x_all[b,t]
+                noise = noise_all[b, t]  # (C, H, W) 噪声图像
                 # 将 x_t 经过 VAE 解码器
                 x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
                 # 保存图像 x_t
@@ -1119,10 +1118,11 @@ class GaussianDiffusion:
                 noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
                 # 保存噪声图像
                 save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png')
-
-                pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
+                if t != x_t_all.shape[1]-1:                    
+                    pred_x = pred_x_all[b,t]
+                    pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
                 # 保存图像 x_t
-                save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png')
+                    save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png')
 
         print(f"Saved image x_t and noise_ in {new_epoch_dir}")
 
@@ -1156,14 +1156,15 @@ class GaussianDiffusion:
         
         B, TN, C, PH, PW = x_t_all.shape
         _, T, _, H, W = x_t_all_ori.shape
+        N = TN // T
         terms = {}
 
         # ！！！KL Loss and vb loss is not needed for now
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             raise NotImplementedError(self.loss_type)
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w)
-            self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output, H, W), x_start.device, save_dir='./check_code')
+            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+            self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output[:, N-1:-1,...], H, W), x_start.device, save_dir='./check_code')
             """
             #这是预测均值和方差时，此时通道数由3变为6
             if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
@@ -1192,7 +1193,7 @@ class GaussianDiffusion:
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
                     x_start=x_start, x_t_all=x_t_all, t=t
-                )[0]   
+                )[0]
             elif self.model_mean_type == ModelMeanType.START_X:
                 x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
                 x_start_all = to_patch_seq_all(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
@@ -1205,20 +1206,24 @@ class GaussianDiffusion:
             elif self.model_mean_type == ModelMeanType.EPSILON:
                 noise_all = to_patch_seq_all(noise_all, model.module.patch_size) 
                 target = th.cat([
-                    noise_all[:, 1:],        # (B, T-1, C, H, W)
+                    noise_all[:, 1:],        # (B, TN-1, C, H, W)
                     eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
                 ], dim=1)             
             
             assert model_output.shape == target.shape
-            #pdb.set_trace()
+            #pdb.set_trace())
             mask = (t != -1)
             mask = mask.repeat_interleave(TN//mask.shape[1], dim=1)
             # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
-            mask = mask.reshape(B * TN, 1, 1, 1).float()
-            # Merge B and T to treat each patch as一个样本点
-            model_output = model_output.view(B * TN, C, PH, PW)
-            target = target.view(B * TN, C, PH, PW)
+            LEN = TN if self.model_mean_type != ModelMeanType.PREVIOUS_X else TN-N+1
+            mask = mask[:,(TN-LEN):,...]
+            model_output = model_output[:,(TN-LEN):,...]
+            target = target[:,:LEN,...]
 
+            mask = mask.reshape(B * LEN, 1, 1, 1).float()
+            # Merge B and T to treat each patch as一个样本点
+            model_output = model_output.reshape(B * LEN, C, PH, PW)
+            target = target.reshape(B * LEN, C, PH, PW)
             terms["mse"] = mean_flat((target - model_output) ** 2) * mask
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
