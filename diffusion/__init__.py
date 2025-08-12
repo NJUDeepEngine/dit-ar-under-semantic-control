@@ -5,7 +5,7 @@
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
-from .diffusion_utils import to_patch_seq,from_patch_seq
+from .diffusion_utils import to_patch_seq_all,from_patch_seq_last, to_patch_seq_single
 
 
 def create_diffusion(

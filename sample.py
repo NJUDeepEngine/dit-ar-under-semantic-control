@@ -12,7 +12,7 @@ import pdb
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
-from diffusion import create_diffusion,to_patch_seq,from_patch_seq
+from diffusion import create_diffusion,from_patch_seq_last,to_patch_seq_single
 from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
@@ -43,7 +43,7 @@ def main(args):
     model.eval()  # important!
     # directly use ddim
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
     #vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     # Labels to condition the model with (feel free to change):
@@ -58,8 +58,7 @@ def main(args):
 
     # Setup classifier-free guidance:
     z = torch.cat([z, z], 0)
-    z=z.unsqueeze(1)
-    z_start=to_patch_seq(z,args.patch_size)
+    z_start=to_patch_seq_single(z,args.patch_size)
     y_null = torch.tensor([1000] * n, device=device)
     y = torch.cat([y, y_null], 0)
     model_kwargs = dict(y=y, is_training=False,cfg_scale=args.cfg_scale)
@@ -71,7 +70,7 @@ def main(args):
     samples = diffusion.ar_p_sample_loop(model.forward_with_cfg,z_start.shape,z_start,max_gen_len=max_gen_len,clip_denoised=False,model_kwargs=model_kwargs,device=device,num_patch=num_patches,vae_path="/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema")
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     #pdb.set_trace()
-    samples = from_patch_seq(samples, patch_size=args.patch_size, patch_num=num_patches, out_channels=args.out_channels)
+    samples = from_patch_seq_last(samples, patch_size=args.patch_size, patch_num=num_patches, out_channels=args.out_channels)
     samples = vae.decode(samples / 0.18215).sample
 
     # Save and display images:

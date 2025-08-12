@@ -90,7 +90,17 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
 # Dataset 或 dataloader 里
 # 原始数据: x (B, T, C, H, W)
 
-def to_patch_seq(x, patch_size):
+def to_patch_seq_single(x, patch_size):
+    B, C, H, W = x.shape
+    assert H % patch_size == 0 and W % patch_size == 0
+    h, w = H // patch_size, W // patch_size
+
+    x = x.reshape(B, C, h, patch_size, w, patch_size)  # 分 patch
+    x = x.permute(0, 2, 4, 1, 3, 5).contiguous()  # B, T, h, w, C, p, p
+    x = x.reshape(B, h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
+    return x
+
+def to_patch_seq_all(x, patch_size):
     B, T, C, H, W = x.shape
     assert H % patch_size == 0 and W % patch_size == 0
     h, w = H // patch_size, W // patch_size
@@ -100,12 +110,22 @@ def to_patch_seq(x, patch_size):
     x = x.reshape(B, T * h * w, C, patch_size, patch_size)  # B, T*Num_Patch, C, P, P
     return x
 
+def from_patch_seq_single(x, h, w):
+    B, N, C, P, _ = x.shape
+    patch_h, patch_w = h // P, w // P
+    num_patch = N
+
+    # 1. 还原到 patch 网格
+    x = x.reshape(B, patch_h, patch_w, C, P, P)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+    x = x.reshape(B, C, h, w)
+    return x
+
 def from_patch_seq_all(x, h, w):
     B, TN, C, P, _ = x.shape
     patch_h, patch_w = h // P, w // P
     num_patch = patch_h * patch_w
     T = TN // num_patch
-
 
     # 1. 还原到 patch 网格
     x = x.reshape(B, T, patch_h, patch_w, C, P, P)
@@ -113,7 +133,7 @@ def from_patch_seq_all(x, h, w):
     x = x.reshape(B, T, C, h, w)
     return x
 
-def from_patch_seq(patch_seq, eos_token=None, patch_size=4, patch_num=64, out_channels=4):
+def from_patch_seq_last(patch_seq, eos_token=None, patch_size=4, patch_num=64, out_channels=4):
     """
     Args:
         patch_seq: (B, L, C, P, P)

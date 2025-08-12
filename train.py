@@ -31,7 +31,7 @@ import os
 from torchvision.utils import save_image
 
 from models import DiT_models
-from diffusion import create_diffusion,to_patch_seq,from_patch_seq
+from diffusion import create_diffusion,from_patch_seq_last
 from diffusers.models import AutoencoderKL
 
 
@@ -260,20 +260,13 @@ def main(args):
     running_loss = 0
     start_time = time()
     
-        # 只取一次数据集中的一个batch（即一张图片）
-    x, y = next(iter(loader))  # 从loader中取一个batch
-    save_image(x, 'x_started.png')
-    #print(x.shape)
-    x_origin = x.to(device)
-    y_origin = y.to(device)
-    #print(x.shape)
-    #print(y)
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-            sampler.set_epoch(epoch)
-            logger.info(f"Beginning epoch {epoch}...")
-            x=x_origin.clone()
-            y=y_origin.clone( )
+        sampler.set_epoch(epoch)
+        logger.info(f"Beginning epoch {epoch}...")
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
             with torch.no_grad():
                 # 将输入图像映射到潜在空间并归一化
                 #print(x.shape)
@@ -359,7 +352,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-S/8")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=10)
-    parser.add_argument("--epochs", type=int, default=16000)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--global-batch-size", type=int, default=32)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training

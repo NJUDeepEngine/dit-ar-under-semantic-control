@@ -11,7 +11,7 @@ import torch as th
 import enum
 import pdb
 import os
-from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq, from_patch_seq_all, timesteps_padding, expand_timesteps_like_patches
+from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq_single, to_patch_seq_all, from_patch_seq_all, from_patch_seq_single, timesteps_padding, expand_timesteps_like_patches
 from diffusers.models import AutoencoderKL
 from torchvision.utils import save_image, make_grid
 def mean_flat(tensor):
@@ -250,29 +250,19 @@ class GaussianDiffusion:
         if max_t is None:
             max_t = self.num_timesteps
 
-        # Create tensor of timesteps [max_t-1,  ..., 2, 1, 0]
-        timesteps = th.arange(max_t - 1, -1, -1, device=x_start.device, dtype=th.long)
+        timesteps = th.arange(max_t - 1, -1, -1, device=x_start.device, dtype=th.long) #[max_t-1,  ..., 2, 1, 0]
+        timesteps_expanded = timesteps.unsqueeze(0).repeat(N, 1).view(-1) #flatten to (N*max_t)
+        x_start_expanded = x_start.unsqueeze(1).expand(-1, max_t, *x_start.shape[1:]).reshape(-1, *x_start.shape[1:]) #flatten to (N*max_t, ...)
 
-        # Expand timesteps to (N, max_t) and then flatten to (N*max_t)
-        timesteps_expanded = timesteps.unsqueeze(0).repeat(N, 1).view(-1)
-
-        # Expand x_start to (N, max_t, ...) then flatten to (N*max_t, ...)
-        x_start_expanded = x_start.unsqueeze(1).expand(-1, max_t, *x_start.shape[1:]).reshape(-1, *x_start.shape[1:])
-
-        # Prepare noise
         if noise is None:
             noise = th.randn_like(x_start_expanded)
         else:
             noise = noise.reshape(-1, *x_start.shape[1:])
 
-        # Extract alphas for each timestep, shape broadcasted to x_start_expanded
         sqrt_alphas = _extract_into_tensor(self.sqrt_alphas_cumprod, timesteps_expanded, x_start_expanded.shape)
         sqrt_one_minus_alphas = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, timesteps_expanded, x_start_expanded.shape)
 
-        # Compute noisy samples for all timesteps at once
         x_t_flat = sqrt_alphas * x_start_expanded + sqrt_one_minus_alphas * noise
-
-        # Reshape back to (N, max_t, ...)
         x_t = x_t_flat.view(N, max_t, *x_start.shape[1:])
         return x_t
 
@@ -323,7 +313,7 @@ class GaussianDiffusion:
         if x_start.dim() == 4:
             _, _, H, W = x_start.shape
             # 先转成 BTNCPP
-            x_start = to_patch_seq(x_start.unsqueeze(1).expand(B, T, C, H, W), P)
+            x_start = to_patch_seq_all(x_start.unsqueeze(1).expand(B, T, C, H, W), P)
 
 
 
@@ -530,22 +520,6 @@ class GaussianDiffusion:
         coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t_expanded, x_t.shape)
         coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t_expanded, x_t.shape)
         return coeff1 * x_t - coeff2 * eps
-
-
-    def _predict_all_eps_from_xstart(self, x_t, t, pred_xstart):
-        """
-        Predict eps from x_t and predicted x_0, for patch-level input.
-
-        Args:
-            x_t: (B, T*N, C, P, P)
-            t:   (B, T)
-            pred_xstart: (B, T*N, C, P, P)
-        """
-        assert x_t.shape == pred_xstart.shape
-        t_expanded = expand_timesteps_like_patches(x_t, t)
-        coeff1 = _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t_expanded, x_t.shape)
-        coeff2 = _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t_expanded, x_t.shape)
-        return (coeff1 * x_t - pred_xstart) / coeff2
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
@@ -799,11 +773,7 @@ class GaussianDiffusion:
         # 根据 num_patch 计算图像的高度和宽度
         H = int(P * (num_patch ** 0.5))  # 计算图像的高度
         W = H  # 由于是正方形图像，宽度和高度相同
-        new_z = z_start.clone()
-        # 重新排列 new_z 为 (B, C, H, W)
-        new_z = new_z.view(B, C, int(H / P), P, int(W / P), P)  # 重新排列为 (B, C, H/P, P, W/P, P)
-        new_z = new_z.permute(0, 1, 2, 4, 3, 5)  # 将 P 维度合并，形状变为 (B, C, H, W)
-        new_z = new_z.contiguous().view(B, C, H, W)  # 确保形状为 (B, C, H, W)
+        new_z = from_patch_seq_single(z_start.clone(), H, W)
         last_xt=new_z.clone()
         for step in it:
             all_finished = bool(finished.all())
@@ -831,22 +801,21 @@ class GaussianDiffusion:
             else:
                 break
             if step % num_patch == 0:
-                # 获取最近生成的 num_patch 个 patch
+                # import pdb;pdb.set_trace()
                 samples = seq[:, -num_patch:]  # 形状 (B, num_patch, C, P, P)
+                # 形状变为 (B, C, H, W)
+                samples = from_patch_seq_single(samples, H, W)
                 
-                # 将多个 patch 拼接成一个更大的图像，形状变为 (B, C, H, W)
-                samples = samples.view(B, C, int(H / P), P, int(W / P), P)  # 重新安排为 (B, C, H/P, P, W/P, P)
-                samples = samples.permute(0, 1, 2, 4, 3, 5)  # 将 P 维度合并，形状变为 (B, C, H, W)
-                samples = samples.contiguous().view(B, C, H, W)  # 添加此步，确保 VAE 输入为 (B, C, H, W)
-                
-                # 现在 samples 是噪声图像，我们需要根据 last_xt 来计算 xt-1
-                predicted_noise = samples  # 假设当前的 samples 是模型预测的噪声（epsilon）
-
-                # 根据之前的 xt 和噪声来计算 xt-1
-                xt_minus_1 = (
-                    (last_xt - self.sqrt_one_minus_alphas[step//num_patch] * predicted_noise)
-                    * self.sqrt_alphas[step//num_patch]
-                )
+                if self.model_mean_type == ModelMeanType.EPSILON:
+                    predicted_noise = samples
+                    xt_minus_1 = (
+                        (last_xt - self.sqrt_one_minus_alphas[step//num_patch] * predicted_noise)
+                        * self.sqrt_alphas[step//num_patch]
+                    )
+                elif self.model_mean_type == ModelMeanType.START_X:
+                    raise NotImplementedError("Not Implemented")
+                else:
+                    xt_minus_1 = samples
                 # 使用 VAE 解码（假设 VAE 输入是 (B, C, H, W)）
                 picture_t = vae.decode(xt_minus_1 / 0.18215).sample  # VAE 解码
                 last_xt=xt_minus_1
@@ -1050,7 +1019,7 @@ class GaussianDiffusion:
         # kl = mean_flat(kl) / np.log(2.0)
         kl = mean_flat(kl.reshape(kl.shape[0]*kl.shape[1],-1)) / np.log(2.0)
 
-        x_start_expanded = to_patch_seq(x_start.unsqueeze(1).expand(-1,t.shape[1],-1,-1,-1), x_t.shape[3])
+        x_start_expanded = to_patch_seq_all(x_start.unsqueeze(1).expand(-1,t.shape[1],-1,-1,-1), x_t.shape[3])
         decoder_nll = -discretized_gaussian_log_likelihood(
             x_start_expanded, means=out["mean"], log_scales=0.5 * out["log_variance"]
         )
@@ -1138,28 +1107,24 @@ class GaussianDiffusion:
         print(x_t_all.shape)
         for b in range(x_t_all.shape[0]):  # 遍历每个样本 B
             for t in range(x_t_all.shape[1]):  # 遍历所有时间步的图像
-                    x_t = x_t_all[b, t]  # (C, H, W) 图像
-                    noise = noise_all[b, t]  # (C, H, W) 噪声图像                    
-                    pred_x = pred_x_all[b,t]
-                    # 将 x_t 经过 VAE 解码器
-                    x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
-                    # 保存图像 x_t
-                    save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png')
+                x_t = x_t_all[b, t]  # (C, H, W) 图像
+                noise = noise_all[b, t]  # (C, H, W) 噪声图像                    
+                pred_x = pred_x_all[b,t]
+                # 将 x_t 经过 VAE 解码器
+                x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
+                # 保存图像 x_t
+                save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png')
 
-                    # 可选：保存噪声图像，除非噪声不需要解码
-                    noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
-                    # 保存噪声图像
-                    save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png')
+                # 可选：保存噪声图像，除非噪声不需要解码
+                noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
+                # 保存噪声图像
+                save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png')
 
-                    pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
-                    # 保存图像 x_t
-                    save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png')
+                pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
+                # 保存图像 x_t
+                save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png')
 
         print(f"Saved image x_t and noise_ in {new_epoch_dir}")
-
-    # 使用方法：假设你传入了 x_t_all, noise_all, device
-    # save_generated_images(x_t_all, noise_all, device, save_dir='./check_code')
-
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
@@ -1183,11 +1148,11 @@ class GaussianDiffusion:
 
         if noise is None:
             x_t_all_ori,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
-        else:
+        else: #
             raise NotImplementedError("noise is not None, not implemented yet")
             # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
 
-        x_t_all = to_patch_seq(x_t_all_ori, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
+        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
         B, TN, C, PH, PW = x_t_all.shape
         _, T, _, H, W = x_t_all_ori.shape
@@ -1229,9 +1194,8 @@ class GaussianDiffusion:
                     x_start=x_start, x_t_all=x_t_all, t=t
                 )[0]   
             elif self.model_mean_type == ModelMeanType.START_X:
-                # 先扩展成所有时间步
                 x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
-                x_start_all = to_patch_seq(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
+                x_start_all = to_patch_seq_all(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
 
                 # 添加 eos patch
                 target = th.cat([
@@ -1239,10 +1203,7 @@ class GaussianDiffusion:
                     eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
                 ], dim=1)  # (B, TN, C, H, W)
             elif self.model_mean_type == ModelMeanType.EPSILON:
-                noise_all = to_patch_seq(noise_all, model.module.patch_size) 
-                #print(noise_all.shape, x_t_all.shape, t.shape)
-                #print(eos_patch.shape)
-                #print(model_output.shape)
+                noise_all = to_patch_seq_all(noise_all, model.module.patch_size) 
                 target = th.cat([
                     noise_all[:, 1:],        # (B, T-1, C, H, W)
                     eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
