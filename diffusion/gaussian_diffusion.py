@@ -1114,12 +1114,14 @@ class GaussianDiffusion:
             os.makedirs(save_dir)  # 如果目录不存在，先创建它
         
         self.epoch_count += 1
-        if self.epoch_count % 100 != 0:
+        if ((self.epoch_count <= 100 and self.epoch_count % 10 == 0)
+            or (self.epoch_count <= 1000 and self.epoch_count % 100 == 0)
+            or (self.epoch_count % 1000 == 0)):
+            new_epoch_dir = os.path.join(save_dir, str(self.epoch_count))
+            os.makedirs(new_epoch_dir, exist_ok=True)
+            return new_epoch_dir
+        else:
             return None
-        new_epoch_dir = os.path.join(save_dir, str(self.epoch_count))
-        os.makedirs(new_epoch_dir, exist_ok=True)
-        
-        return new_epoch_dir
 
     # 假设 x_t_all 和 noise_all 已经是 (B, T, 10, 10, C, H, W) 的形状
     def save_generated_images(self,x_t_all, noise_all, pred_x_all, device, save_dir='./check_code'):
@@ -1196,7 +1198,7 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w)
-            # self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output, H, W), x_start.device, save_dir='./check_code')
+            self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output, H, W), x_start.device, save_dir='./check_code')
             """
             #这是预测均值和方差时，此时通道数由3变为6
             if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
