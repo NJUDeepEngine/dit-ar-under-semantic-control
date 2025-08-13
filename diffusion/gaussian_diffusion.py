@@ -1311,6 +1311,7 @@ class GaussianDiffusion:
                 target = self.q_all_posterior_mean_variance(
                     x_start=x_start, x_t_all=x_t_all, t=t
                 )[0]
+                target[:,(TN-N):] =    eos_patch.unsqueeze(1).expand(-1,N,-1,-1,-1)    
             elif self.model_mean_type == ModelMeanType.START_X:
                 x_start_all = x_start.unsqueeze(1).expand(-1, t.shape[1], -1, -1, -1)  # (B, T, C, H, W)
                 x_start_all = to_patch_seq_all(x_start_all, model.module.patch_size)  # (B, TN, C, H, W)
