@@ -8,7 +8,7 @@ train.py \
 --num-classes 10 \
 --max_gen_len 1000 \
 --epochs 100 \
---ckpt-every 2000 \
+--ckpt-every 1000 \
 --detailed-log-every 1000 \
 --detailed-log-pic-print \
 --detailed-log-middle-vars-print \

@@ -15,6 +15,7 @@ from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_
 from diffusers.models import AutoencoderKL
 from .image_converter import ImageConverter
 from torchvision.utils import save_image, make_grid
+import torch.distributed as dist
 def mean_flat(tensor):
     """
     Take the mean over all non-batch dimensions.
@@ -1224,6 +1225,8 @@ class GaussianDiffusion:
         if log_settings is None:
             return
         if self.step_count % log_settings['log_every'] == 0:
+            if dist.get_rank() != 0:
+                return
             new_dir = os.path.join(log_settings['folder'], str(self.step_count))
             os.makedirs(new_dir, exist_ok=True)
             print(f"Logging training infos to {new_dir}")
