@@ -114,7 +114,7 @@ def from_patch_seq_single(x, h, w):
     B, N, C, P, _ = x.shape
     patch_h, patch_w = h // P, w // P
     num_patch = N
-
+    assert num_patch==patch_h*patch_w
     # 1. 还原到 patch 网格
     x = x.reshape(B, patch_h, patch_w, C, P, P)
     x = x.permute(0, 3, 1, 4, 2, 5).contiguous()

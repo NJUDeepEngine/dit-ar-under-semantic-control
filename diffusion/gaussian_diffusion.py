@@ -718,7 +718,7 @@ class GaussianDiffusion:
             file_path = os.path.join(save_dir, f"{filename}.png")
 
         # 保存图像到指定的文件夹
-        save_image(samples, file_path, nrow=4, normalize=True, value_range=(-1,1))
+        save_image(samples, file_path, nrow=4)
 
     @th.no_grad()
     def ar_p_sample_loop(
@@ -732,7 +732,7 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         device=None,
-        progress=True,
+        progress=False,
         num_patch=64,
         vae_path=None
     ):
@@ -751,7 +751,7 @@ class GaussianDiffusion:
         seq = z_start.to(device)
         B, L0, C, P, _ = seq.shape
         assert max_gen_len >= L0, f"max_gen_len({max_gen_len}) 必须 ≥ 起始长度 L0({L0})"
-        max_new = max_gen_len - L0
+        max_new = max_gen_len-L0+num_patch
 
         # EOS：全 0 patch；阈值可调整
         eos_token = th.zeros(C, P, P, device=device, dtype=seq.dtype)  # 精确 0，便于后续等号判断
@@ -761,7 +761,7 @@ class GaussianDiffusion:
         # 每个样本的“完成”标志
         finished = th.zeros(B, dtype=th.bool, device=device)
         # 进度条
-        it = range(max_new)
+        
         if progress:
             try:
                 from tqdm.auto import trange
@@ -769,18 +769,26 @@ class GaussianDiffusion:
             except Exception:
                 pass
         if vae_path is not None:
-            vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+            vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/vae").to(device)
         # 根据 num_patch 计算图像的高度和宽度
         H = int(P * (num_patch ** 0.5))  # 计算图像的高度
         W = H  # 由于是正方形图像，宽度和高度相同
-        new_z = from_patch_seq_single(z_start.clone(), H, W)
+        samples0 = seq[:, -num_patch:]
+        samples0 = from_patch_seq_single(samples0, H, W)
+        picture_0 = vae.decode(samples0  / 0.18215).sample  # VAE 解码
+        self.save_image_lmy(picture_0, f"generated_0") 
+
+        new_z = from_patch_seq_all(z_start.clone(), H, W)
         last_xt=new_z.clone()
+        it = range(1,max_new+1)
+        #pdb.set_trace()
         for step in it:
+            #print("step",step)
             all_finished = bool(finished.all())
             if not all_finished:
                 # 仅当仍有未完成样本时才调用模型
                 next_patch = model(seq, **model_kwargs)  # 期望 (B, 1, C, P, P)
-                print(f"next_patch max: {next_patch.max()}, min: {next_patch.min()}, mean: {next_patch.mean()}")
+                #print(f"next_patch max: {next_patch.max()}, min: {next_patch.min()}, mean: {next_patch.mean()}")
                 # —— 阈值检测：谁越过阈值，谁这一帧就“强制改成精确的 EOS” ——
                 diff = (next_patch - eos_exp).float()
                 is_eos_now = (diff.pow(2).mean(dim=(2, 3, 4)).squeeze(1) < eos_tol)  # (B,)
@@ -801,10 +809,21 @@ class GaussianDiffusion:
             else:
                 break
             if step % num_patch == 0:
-                # import pdb;pdb.set_trace()
-                samples = seq[:, -num_patch:]  # 形状 (B, num_patch, C, P, P)
+                #print(seq[:,  -num_patch:,...].shape)
+                assert seq.shape[1]%num_patch==0
+                
+
+                samples=from_patch_seq_all(seq[:, -num_patch:,...], H, W)
+                semples_seq_all=to_patch_seq_all(samples, P)
+                samples_=from_patch_seq_all(semples_seq_all, H, W)
+                samples_seq_all=to_patch_seq_all(samples_,P)
+                
+                assert(th.allclose(samples, samples_, atol=1e-6))
+                assert(th.allclose(semples_seq_all, samples_seq_all, atol=1e-6))
+
+                #samples = seq[:, -num_patch:]  # 形状 (B, num_patch, C, P, P)
                 # 形状变为 (B, C, H, W)
-                samples = from_patch_seq_single(samples, H, W)
+                #samples = from_patch_seq_single(samples, H, W)
                 
                 if self.model_mean_type == ModelMeanType.EPSILON:
                     predicted_noise = samples
@@ -812,19 +831,142 @@ class GaussianDiffusion:
                         (last_xt - self.sqrt_one_minus_alphas[step//num_patch] * predicted_noise)
                         * self.sqrt_alphas[step//num_patch]
                     )
+                    raise NotImplementedError("Not Implemented")
                 elif self.model_mean_type == ModelMeanType.START_X:
                     raise NotImplementedError("Not Implemented")
                 else:
-                    xt_minus_1 = samples
+                    xt_minus_1 = samples.squeeze(1)
                 # 使用 VAE 解码（假设 VAE 输入是 (B, C, H, W)）
                 picture_t = vae.decode(xt_minus_1 / 0.18215).sample  # VAE 解码
-                last_xt=xt_minus_1
-                self.save_image_lmy(picture_t, f"generated_{step}")  # 保存图像
+                last_xt=xt_minus_1    
+                self.save_image_lmy(picture_t, f"generated_{step//num_patch}")  # 保存图像
+                    
 
             # 清理不需要的变量，释放显存
             del next_patch, write_eos_mask
             th.cuda.empty_cache()
         return seq  # (B, L_final, C, P, P)
+
+    @th.no_grad()
+    def ar_sample_test(
+        self,
+        model,                 # e.g. model.forward_with_cfg
+        shape,                 # 仅用于推断 batch/device（不限制长度）
+        z_start,               # (B, L0, C, P, P) 起始序列（必须有）
+        max_gen_len=1024,      # “总长度上限”（包含起始）；会转成 max_new = max_gen_len - L0
+        clip_denoised=False,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        num_patch=64,
+        vae_path=None
+    ):
+        #pdb.set_trace()
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        # --- 取 device，兼容 bound method ---
+        if device is None:
+            try:
+                device = next(model.__self__.parameters()).device  # type: ignore[attr-defined]
+            except Exception:
+                device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+        # --- 起始 & 维度 ---
+        seq = z_start[:,:num_patch].to(device)
+        B, L0, C, P, _ = z_start.shape
+
+        if vae_path is not None:
+            vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/vae").to(device)
+        # 根据 num_patch 计算图像的高度和宽度
+        H = int(P * (num_patch ** 0.5))  # 计算图像的高度
+        W = H  # 由于是正方形图像，宽度和高度相同
+        samples0 = z_start[:, :num_patch]
+        
+        samples0 = from_patch_seq_single(samples0, H, W)
+        picture_0 = vae.decode(samples0  / 0.18215).sample  # VAE 解码
+        self.save_image_lmy(picture_0, f"generate_0") 
+        
+        samples0 = z_start[:, -num_patch:]
+        samples0 = from_patch_seq_single(samples0, H, W)
+        picture_0 = vae.decode(samples0  / 0.18215).sample  # VAE 解码
+        self.save_image_lmy(picture_0, f"a_0") 
+
+        new_z = from_patch_seq_all(z_start.clone(), H, W)
+        last_xt=new_z.clone()
+        it = range(1,L0-num_patch+1)
+        kw = {} if model_kwargs is None else dict(model_kwargs)
+        y=kw.pop("y", None)
+        model_kwargs_ = dict(y=y, is_training=True)
+        model_all_out=model(z_start,**model_kwargs_)
+        
+        terms={}
+        target=z_start[:,-num_patch:]
+        predicted_x_0=model_all_out[:,-num_patch-1:-1]
+
+        target = target.flatten(0, 1) 
+        model_output=predicted_x_0.flatten(0, 1) 
+        terms["mse"] = mean_flat((target - model_output) ** 2)
+        loss_mean=terms["mse"].mean()         
+        print("loss_mean",loss_mean)
+        #pdb.set_trace()
+
+        
+        predicted_x_0=from_patch_seq_all(predicted_x_0, H, W).squeeze(1)
+        predicted_x_0 = vae.decode(predicted_x_0 / 0.18215).sample  
+        self.save_image_lmy(predicted_x_0, f"alllast_0")
+        #pdb.set_trace()
+
+        for step in it:
+            next_patch = model(z_start[:,:num_patch+step], **model_kwargs)  # 期望 (B, 1, C, P, P)
+            
+            seq = th.cat([seq, next_patch], dim=1)
+            if step % num_patch == 0:
+                #print(seq[:,  -num_patch:,...].shape)
+                assert seq.shape[1]%num_patch==0
+
+                terms={}
+                target=z_start[:,step:step+num_patch]
+                model_output = seq[:,-num_patch:]
+
+                target = target.flatten(0, 1) 
+                model_output=model_output.flatten(0, 1) 
+                terms["mse"] = mean_flat((target - model_output) ** 2)
+                loss_mean=terms["mse"].mean()                 
+                #pdb.set_trace()
+                samples=from_patch_seq_all(seq[:, -num_patch:,...], H, W)
+                if self.model_mean_type == ModelMeanType.EPSILON:
+                    predicted_noise = samples
+                    xt_minus_1 = (
+                        (last_xt - self.sqrt_one_minus_alphas[step//num_patch] * predicted_noise)
+                        * self.sqrt_alphas[step//num_patch]
+                    )
+                    raise NotImplementedError("Not Implemented")
+                elif self.model_mean_type == ModelMeanType.START_X:
+                    raise NotImplementedError("Not Implemented")
+                else:
+                    xt_minus_1 = samples.squeeze(1)
+                # 使用 VAE 解码（假设 VAE 输入是 (B, C, H, W)）
+                picture_t = vae.decode(xt_minus_1 / 0.18215).sample  # VAE 解码
+                last_xt=xt_minus_1    
+                
+                self.save_image_lmy(picture_t, f"generated_{step//num_patch}")  # 保存图像
+                
+                picture_t_true=from_patch_seq_all(z_start[:,step:num_patch+step],H,W)
+                #pdb.set_trace()  
+                picture_t_true=vae.decode(picture_t_true.squeeze(1) / 0.18215).sample 
+                self.save_image_lmy(picture_t_true, f"generated_{step//num_patch}_0")
+                #pdb.set_trace()    
+
+            # 清理不需要的变量，释放显存
+            del next_patch
+            th.cuda.empty_cache()
+        return seq  # (B, L_final, C, P, P)
+
+
+
 
     def ddim_sample(
         self,
@@ -1049,7 +1191,7 @@ class GaussianDiffusion:
 
         # 预分配输出 (B, T, C, H, W)
         x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
-        noise_all = th.zeros_like(x_t_all)
+        noise_global_all = th.zeros_like(x_t_all)
 
         for b in range(B):
             x_0 = x_start[b]
@@ -1058,7 +1200,7 @@ class GaussianDiffusion:
                 cur_step = t[b, idx].item()
                 if cur_step == 0:
                     x_t_all[b, idx] = x_t
-                    noise_all[b, idx] = 0.0  # 没有噪声
+                    noise_global_all[b, idx] = 0.0  # 没有噪声
             for step in range(1, self.num_timesteps + 1):
                 noise = th.randn_like(x_t)
                 sqrt_alpha = self.sqrt_alphas[step - 1]
@@ -1071,9 +1213,9 @@ class GaussianDiffusion:
                         sqrt_alpha_cum = self.sqrt_alphas_cumprod[step]
                         sqrt_one_minus_alpha_cum = self.sqrt_one_minus_alphas_cumprod[step]
                         epsilon_t = (x_t - sqrt_alpha_cum * x_0) / sqrt_one_minus_alpha_cum
-                        noise_all[b, idx] = epsilon_t
+                        noise_global_all[b, idx] = epsilon_t
 
-        return x_t_all, noise_all
+        return x_t_all, noise_global_all
 
 
     # 获取最大的 epoch 目录，并创建新的目录
@@ -1092,7 +1234,6 @@ class GaussianDiffusion:
         else:
             return None
 
-    # 假设 x_t_all 和 noise_all 已经是 (B, T, 10, 10, C, H, W) 的形状
     def save_generated_images(self,x_t_all, noise_all, pred_x_all, device, save_dir='./check_code'):
         # 获取新的 epoch 文件夹路径
         new_epoch_dir = self.get_new_epoch_directory(save_dir)
@@ -1100,7 +1241,7 @@ class GaussianDiffusion:
             return None
         print(f"Saving images to {new_epoch_dir}")
         # 加载 VAE 模型
-        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+        vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/vae").to(device)
         
         # 遍历时间步 (T)
             # 遍历批次 B 和图像
@@ -1112,19 +1253,19 @@ class GaussianDiffusion:
                 # 将 x_t 经过 VAE 解码器
                 x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
                 # 保存图像 x_t
-                save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png')
+                save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
 
                 # 可选：保存噪声图像，除非噪声不需要解码
                 noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
                 # 保存噪声图像
-                save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png')
+                save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
                 if t != x_t_all.shape[1]-1:                    
                     pred_x = pred_x_all[b,t]
                     pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
                 # 保存图像 x_t
-                    save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png')
+                    save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
 
-        print(f"Saved image x_t and noise_ in {new_epoch_dir}")
+        print(f"During training,saved image x_t ,noise and x_predict in {new_epoch_dir}")
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
@@ -1143,8 +1284,6 @@ class GaussianDiffusion:
         assert t is not None
         if isinstance(t, int):
             t = th.tensor([t] * x_start.shape[0], device=x_start.device)
-        if len(t.shape) == 1:
-            wrapped_t = timestep_padding(t)['patched_timesteps']
 
         if noise is None:
             x_t_all_ori,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
@@ -1158,37 +1297,15 @@ class GaussianDiffusion:
         _, T, _, H, W = x_t_all_ori.shape
         N = TN // T
         terms = {}
-
+        
         # ！！！KL Loss and vb loss is not needed for now
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             raise NotImplementedError(self.loss_type)
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+            #pdb.set_trace()
             self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output[:, N-1:-1,...], H, W), x_start.device, save_dir='./check_code')
-            """
-            #这是预测均值和方差时，此时通道数由3变为6
-            if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
-                B, TN, C2, H, W = model_output.shape
-                assert C2 % 2 == 0, "Expecting 2C channels when predicting variance"
-                C = C2 // 2
-                model_output, model_var_values = th.split(model_output, C, dim=2)  # Split along channel dim  
-                
-                # 构建 frozen_out：均值部分不参与梯度更新
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=2)
-
-                # 计算 VB Loss
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t_all,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-
-                if self.loss_type == LossType.RESCALED_MSE:
-                    raise NotImplementedError("没看懂这是啥")
-                    terms["vb"] *= self.num_timesteps / 1000.0
-            """
+            
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, p, p)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
@@ -1219,7 +1336,7 @@ class GaussianDiffusion:
             mask = mask[:,(TN-LEN):,...]
             model_output = model_output[:,(TN-LEN):,...]
             target = target[:,:LEN,...]
-
+            #pdb.set_trace()
             mask = mask.reshape(B * LEN, 1, 1, 1).float()
             # Merge B and T to treat each patch as一个样本点
             model_output = model_output.reshape(B * LEN, C, PH, PW)
