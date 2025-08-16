@@ -6,6 +6,7 @@
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 from .diffusion_utils import to_patch_seq_all,from_patch_seq_last, to_patch_seq_single
+from .image_converter import ImageConverter
 
 
 def create_diffusion(
@@ -16,7 +17,9 @@ def create_diffusion(
     predict_xstart=False,
     learn_sigma=False,
     rescale_learned_sigmas=False,
-    diffusion_steps=1000
+    diffusion_steps=1000,
+    image_converter=None,
+    training_settings=None
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
     if use_kl:
@@ -42,6 +45,8 @@ def create_diffusion(
             if not learn_sigma
             else gd.ModelVarType.LEARNED_RANGE
         ),
-        loss_type=loss_type
+        loss_type=loss_type,
+        image_converter=image_converter,
+        training_settings=training_settings
         # rescale_timesteps=rescale_timesteps,
     )

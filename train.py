@@ -28,10 +28,11 @@ from time import time
 import argparse
 import logging
 import os
+import json
 from torchvision.utils import save_image
 
 from models import DiT_models
-from diffusion import create_diffusion,from_patch_seq_last
+from diffusion import create_diffusion,from_patch_seq_last, ImageConverter
 from diffusers.models import AutoencoderKL
 
 
@@ -137,12 +138,22 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        with open(f"{experiment_dir}/training_args.json", 'w') as f:
+            json.dump(vars(args), f, indent=4)
+        custom_logger_setting = {
+            "folder": experiment_dir,
+            "log_every": args.detailed_log_every,
+            "pic_print": args.detailed_log_pic_print,
+            "middle_vars_print": args.detailed_log_middle_vars_print,
+            "target_print": args.detailed_log_target_print,
+            "loss_analysis": args.detailed_log_loss_analysis
+        }
     else:
         logger = create_logger(None)
+        custom_logger_setting = None
     
     wandb_run = None
     if args.use_wandb and dist.get_rank() == 0:
-        # 小心：如果你想让这次 run 续写到同一个 W&B run（很少需要），传入 id + resume
         init_kwargs = dict(
             project=args.wandb_project,
             entity=args.wandb_team,
@@ -153,23 +164,28 @@ def main(args):
             init_kwargs.update(id=args.wandb_id, resume=args.wandb_resume)
 
         wandb_run = wandb.init(**init_kwargs)
-    # Create model:
+         
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
     )
-    # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    
+    custom_training_settings = {
+        "fixed_sequence": args.fixed_sequence,  
+        "use_real_target": args.use_real_target
+    }
+
+    ema = deepcopy(model).to(device)
     requires_grad(ema, False)
+    vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
+    image_converter = ImageConverter(h=latent_size, w=latent_size, patch_size=model.patch_size, vae=vae)
     model = DDP(model.to(device), device_ids=[device])
-    diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000)  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema").to(device)
-    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000,image_converter=image_converter, training_settings = custom_training_settings)
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
     
     # Variables for monitoring/logging purposes:
@@ -248,18 +264,17 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    # 只在不恢复时初始化 EMA；恢复时保留 ckpt 里的 EMA
     if args.resume_ckpt is None:
         update_ema(ema, model.module, decay=0)
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    model.train()
+    ema.eval()
 
     # Variables for monitoring/logging purposes:
     #train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
-    
+
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
@@ -268,19 +283,15 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                # 将输入图像映射到潜在空间并归一化
-                #print(x.shape)
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 check_x=vae.decode(x / 0.18215).sample
-                #save_image(check_x,'check_x.png')
-                #save_image(check_x,'norm_x.png',normalize=True, value_range=(-1, 1))
-            #print("after vae:",x.shape)
-            rand_t = 100  # 随机整数采样
-            t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)  # 用该值填充整个batch
+            rand_t = 100
+            t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)
 
             model_kwargs = dict(y=y)
             # 计算当前batch的损失
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+
+            loss_dict = diffusion.training_losses(model, x, t, custom_logger_setting, model_kwargs)
             loss = loss_dict["loss"].mean()
 
             opt.zero_grad()
@@ -355,7 +366,6 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--global-batch-size", type=int, default=32)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=100)
@@ -369,6 +379,15 @@ if __name__ == "__main__":
     parser.add_argument("--resume-ckpt", type=str, default=None, help="Path to a checkpoint to resume from")
     parser.add_argument("--resume-epoch", type=int, default=None, help="Resume from a specific epoch")
     parser.add_argument("--resume-step", type=int, default=None, help="Resume from a specific step")
+    parser.add_argument("--description", type=str, default=None, help="Describe what the turn is training for")
+    parser.add_argument("--vae-path", type=str, default="stabilityai/sd-vae-ft-ema", help="Describe where vae model from")
+    parser.add_argument("--detailed-log-every", type=int, default=100)
+    parser.add_argument("--detailed-log-pic-print", action="store_true")
+    parser.add_argument("--detailed-log-middle-vars-print", action="store_true")
+    parser.add_argument("--detailed-log-target-print", action="store_true")
+    parser.add_argument("--fixed-sequence", action="store_true")
+    parser.add_argument("--use-real-target", action="store_true")
+    parser.add_argument("--detailed-log-loss-analysis", action="store_true")
     args = parser.parse_args()
     main(args)
 """

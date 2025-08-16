@@ -43,11 +43,11 @@ def main(args):
     model.eval()  # important!
     # directly use ddim
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    vae = AutoencoderKL.from_pretrained("/data0/dit-assets/sd-vae-ft-ema").to(device)
     #vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     # Labels to condition the model with (feel free to change):
-    class_labels = [0, 1, 2, 3]
+    class_labels = range(args.class_labels)
 
     # Create sampling noise:
     n = len(class_labels)
@@ -57,19 +57,24 @@ def main(args):
     y = torch.tensor(class_labels, device=device)
 
     # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
+    # z = torch.cat([z, z], 0)
     z_start=to_patch_seq_single(z,args.patch_size)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, is_training=False,cfg_scale=args.cfg_scale)
+    # y_null = torch.tensor([1000] * n, device=device)
+    # y = torch.cat([y, y_null], 0)
+    model_kwargs = dict(y=y, is_training=False)
     # Sample images:
-    #samples = diffusion.p_sample_loop(
-    #    model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
-    #)
-    #pdb.set_trace()
-    samples = diffusion.ar_p_sample_loop(model.forward_with_cfg,z_start.shape,z_start,max_gen_len=max_gen_len,clip_denoised=False,model_kwargs=model_kwargs,device=device,num_patch=num_patches,vae_path="/data0/lmy/dit-ar-under-semantic-control/sd-vae-ft-ema")
+    samples = diffusion.ar_p_sample_loop(
+        model.forward,
+        z_start.shape,
+        z_start,
+        max_gen_len=max_gen_len,
+        clip_denoised=False,
+        model_kwargs=model_kwargs,
+        device=device,
+        num_patch=num_patches,
+        vae_path="/data0/dit-assets/sd-vae-ft-ema"
+    )
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    #pdb.set_trace()
     samples = from_patch_seq_last(samples, patch_size=args.patch_size, patch_num=num_patches, out_channels=args.out_channels)
     samples = vae.decode(samples / 0.18215).sample
 
@@ -91,5 +96,7 @@ if __name__ == "__main__":
     parser.add_argument("--patch-size",type=int,default=4)
     parser.add_argument("--max-step",type=int,default=1000)
     parser.add_argument("--out-channels",type=int,default=4)
+    parser.add_argument("--class-labels",type=int,default=4)
+    
     args = parser.parse_args()
     main(args)

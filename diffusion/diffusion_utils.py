@@ -245,3 +245,4 @@ def expand_timesteps_like_patches(x, t):
     # Expand t: (B, T) → (B, T, N) → (B, T*N)
     t_expanded = t.unsqueeze(2).expand(B, T, N).reshape(B, TN)
     return t_expanded
+

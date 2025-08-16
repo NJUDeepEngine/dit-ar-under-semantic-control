@@ -13,6 +13,7 @@ import pdb
 import os
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl, to_patch_seq_single, to_patch_seq_all, from_patch_seq_all, from_patch_seq_single, timesteps_padding, expand_timesteps_like_patches
 from diffusers.models import AutoencoderKL
+from .image_converter import ImageConverter
 from torchvision.utils import save_image, make_grid
 def mean_flat(tensor):
     """
@@ -156,14 +157,19 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        loss_type
+        loss_type,
+        image_converter = None,
+        training_settings = None
     ):
-        self.epoch_count = 0
+        self.step_count = 0
         self.inference_dir = 'inference'  # 指定推理结果存储根目录
         self.current_subdir = None
+        self.memory_seq = None
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
+        self.image_converter = image_converter
+        self.training_settings = training_settings
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -965,9 +971,12 @@ class GaussianDiffusion:
             th.cuda.empty_cache()
         return seq  # (B, L_final, C, P, P)
 
+<<<<<<< HEAD
 
 
 
+=======
+>>>>>>> merge
     def ddim_sample(
         self,
         model,
@@ -1217,57 +1226,65 @@ class GaussianDiffusion:
 
         return x_t_all, noise_global_all
 
+    def logging(self, infos, log_settings):
+        if log_settings is None:
+            return
+        if self.step_count % log_settings['log_every'] == 0:
+            new_dir = os.path.join(log_settings['folder'], str(self.step_count))
+            os.makedirs(new_dir, exist_ok=True)
+            print(f"Logging training infos to {new_dir}")
 
-    # 获取最大的 epoch 目录，并创建新的目录
-    def get_new_epoch_directory(self,save_dir='./check_code'):
-        # 检查默认保存路径下的所有子目录
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)  # 如果目录不存在，先创建它
-        
-        self.epoch_count += 1
-        if ((self.epoch_count <= 100 and self.epoch_count % 10 == 0)
-            or (self.epoch_count <= 1000 and self.epoch_count % 100 == 0)
-            or (self.epoch_count % 1000 == 0)):
-            new_epoch_dir = os.path.join(save_dir, str(self.epoch_count))
-            os.makedirs(new_epoch_dir, exist_ok=True)
-            return new_epoch_dir
-        else:
-            return None
-
-    def save_generated_images(self,x_t_all, noise_all, pred_x_all, device, save_dir='./check_code'):
-        # 获取新的 epoch 文件夹路径
-        new_epoch_dir = self.get_new_epoch_directory(save_dir)
-        if new_epoch_dir == None:
-            return None
-        print(f"Saving images to {new_epoch_dir}")
-        # 加载 VAE 模型
-        vae = AutoencoderKL.from_pretrained("/data0/lmy/dit-ar-under-semantic-control/vae").to(device)
-        
-        # 遍历时间步 (T)
-            # 遍历批次 B 和图像
-        print(x_t_all.shape)
-        for b in range(x_t_all.shape[0]):  # 遍历每个样本 B
-            for t in range(x_t_all.shape[1]):  # 遍历所有时间步的图像
-                x_t = x_t_all[b, t]  # (C, H, W) 图像
-                noise = noise_all[b, t]  # (C, H, W) 噪声图像
-                # 将 x_t 经过 VAE 解码器
-                x_t_decoded = vae.decode(x_t.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
-                # 保存图像 x_t
-                save_image(x_t_decoded, f'{new_epoch_dir}/x_t_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
-
-                # 可选：保存噪声图像，除非噪声不需要解码
-                noise_decoded = vae.decode(noise.unsqueeze(0).to(device)/0.18215).sample  # 解码噪声图像
-                # 保存噪声图像
-                save_image(noise_decoded, f'{new_epoch_dir}/noise_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
-                if t != x_t_all.shape[1]-1:                    
-                    pred_x = pred_x_all[b,t]
-                    pred_x_decoded = vae.decode(pred_x.unsqueeze(0).to(device)/0.18215).sample  # 解码后是 (1, C, H, W)
-                # 保存图像 x_t
-                    save_image(pred_x_decoded, f'{new_epoch_dir}/x_pred_b{b}_t{t}.png',normalize=True, value_range=(-1, 1))
-
-        print(f"During training,saved image x_t ,noise and x_predict in {new_epoch_dir}")
-
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+            if log_settings['pic_print']:
+                print(f"Saving images to {new_dir}")
+                if "x_t_all" in infos:
+                    x_t_all = infos["x_t_all"]
+                    for b in range(x_t_all.shape[0]):  # 遍历每个样本 B
+                        for t in range(x_t_all.shape[1]):  # 遍历所有时间步的图像
+                            x_t = x_t_all[b, t]
+                            save_image(self.image_converter.decode(x_t), f'{new_dir}/b{b}_t{t}_xt.png')
+                if "noise_all" in infos:
+                    noise_all = infos["noise_all"]
+                    for b in range(noise_all.shape[0]):  # 遍历每个样本 B
+                        for t in range(noise_all.shape[1]):  # 遍历所有时间步的图像
+                            noise = noise_all[b, t]
+                            save_image(self.image_converter.decode(noise), f'{new_dir}/b{b}_t{t}_noise.png')
+                if "x_pred_all" in infos:
+                    x_pred_all = infos["x_pred_all"]
+                    for b in range(x_pred_all.shape[0]):  # 遍历每个样本 B
+                        for t in range(x_pred_all.shape[1]):  # 遍历所有时间步的图像
+                            x_pred = x_pred_all[b, t]
+                            save_image(self.image_converter.decode(x_pred), f'{new_dir}/b{b}_t{t}_xpred.png')
+            if log_settings['middle_vars_print']:
+                print(f"Saving model_output to {new_dir}")
+                if "model_output" in infos:
+                    th.save(infos["model_output"],f"{new_dir}/model_output.pt")
+                if "x_t_all" in infos:
+                    th.save(infos["x_t_all"],f"{new_dir}/x_t_all.pt")
+                if "noise_all" in infos:
+                    th.save(infos["noise_all"],f"{new_dir}/noise_all.pt")
+                if "x_pred_all" in infos:
+                    th.save(infos["x_pred_all"],f"{new_dir}/x_pred_all.pt")
+            if log_settings['target_print']:
+                print(f"Saving target to {new_dir}")
+                if "target" in infos:
+                    th.save(infos["target"],f"{new_dir}/target.pt")
+            if log_settings['loss_analysis']:
+                print(f"Saving loss analysis to {new_dir}/loss_analysis.txt")
+                true_target = infos["terms"]
+                real_target = self.image_converter.timeseq2patchseq(infos["x_t_all"])
+                real_target = th.cat([
+                    real_target[:, 1:],  # 跟 x_t 对齐：第 i 个 patch 对应的是 t=i 的 x_t
+                    infos['eos_patch'].unsqueeze(1)  # (B, 1, C, H, W)
+                ], dim=1)  # (B, TN, C, H, W)
+                B,TN,C,H,W=real_target.shape
+                real_target = real_target.reshape(B*TN,C,H,W)
+                model_output = infos["model_output"].reshape(B*TN,C,H,W)
+                real_mse = mean_flat((real_target - model_output) ** 2)
+                with open(f"{new_dir}/loss_analysis.txt","w", encoding="utf-8") as f:
+                    f.write(f"训练的后验MSE值：{infos['terms']['mse']}\n")
+                    f.write(f"和真实值对比计算的MSE值：{real_mse}")
+                    
+    def training_losses(self, model, x_start, t, custom_detailed_log, model_kwargs=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -1279,17 +1296,21 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+        
         if model_kwargs is None:
             model_kwargs = {}
         assert t is not None
         if isinstance(t, int):
             t = th.tensor([t] * x_start.shape[0], device=x_start.device)
 
-        if noise is None:
+        self.step_count += 1
+        if self.training_settings['fixed_sequence']:
+            if self.step_count == 1:
+                self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
+                th.save(self.memory_seq[0], os.path.join(custom_detailed_log['folder'],"saved_x_t_all.pt"))
+            x_t_all_ori,noise_all = self.memory_seq
+        else:
             x_t_all_ori,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
-        else: #
-            raise NotImplementedError("noise is not None, not implemented yet")
-            # x_t_all = self.q_sample_all_timesteps(x_start, noise=noise, max_t=t) # (B, C, H, W) -> (B, T, C, H, W)
 
         x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
         
@@ -1303,9 +1324,37 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+<<<<<<< HEAD
             #pdb.set_trace()
             self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output[:, N-1:-1,...], H, W), x_start.device, save_dir='./check_code')
             
+=======
+            model_output_ori = model_output
+            """
+            #这是预测均值和方差时，此时通道数由3变为6
+            if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
+                B, TN, C2, H, W = model_output.shape
+                assert C2 % 2 == 0, "Expecting 2C channels when predicting variance"
+                C = C2 // 2
+                model_output, model_var_values = th.split(model_output, C, dim=2)  # Split along channel dim  
+                
+                # 构建 frozen_out：均值部分不参与梯度更新
+                frozen_out = th.cat([model_output.detach(), model_var_values], dim=2)
+
+                # 计算 VB Loss
+                terms["vb"] = self._vb_terms_bpd(
+                    model=lambda *args, r=frozen_out: r,
+                    x_start=x_start,
+                    x_t=x_t_all,
+                    t=t,
+                    clip_denoised=False,
+                )["output"]
+
+                if self.loss_type == LossType.RESCALED_MSE:
+                    raise NotImplementedError("没看懂这是啥")
+                    terms["vb"] *= self.num_timesteps / 1000.0
+            """
+>>>>>>> merge
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, p, p)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
@@ -1326,29 +1375,59 @@ class GaussianDiffusion:
                 target = th.cat([
                     noise_all[:, 1:],        # (B, TN-1, C, H, W)
                     eos_patch.unsqueeze(1)      # (B, 1, C, H, W)
-                ], dim=1)             
+                ], dim=1)           
             
             assert model_output.shape == target.shape
             #pdb.set_trace())
             mask = (t != -1)
             mask = mask.repeat_interleave(TN//mask.shape[1], dim=1)
+<<<<<<< HEAD
             # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
             LEN = TN if self.model_mean_type != ModelMeanType.PREVIOUS_X else TN-N+1
             mask = mask[:,(TN-LEN):,...]
             model_output = model_output[:,(TN-LEN):,...]
             target = target[:,:LEN,...]
             #pdb.set_trace()
+=======
+
+            # 这个是为了测试，开启时使用真实的x_t[t,i+1]作为output[t,i]的预测目标
+            # 关闭时使用q(x_t-1\x_0)，即由x_t-1计算出来的后验分布作为预测目标
+            if self.training_settings['use_real_target']:
+                target = th.cat([
+                    x_t_all[:, 1:],  # 跟 x_t 对齐：第 i 个 patch 对应的是 t=i 的 x_t
+                    eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
+                ], dim=1)  # (B, TN, C, H, W)
+                LEN = TN
+            else:
+                # 这里是为了错位：PREVIOUS_X提供的后验分布，每个[t,i]位置算出的后验分布对应位置为[t+1,i]
+                # 而我们希望每个位置对应[t,i+1]，所以target扔掉后N-1个，model_output扔掉前N-1个正好对齐
+                LEN = TN if self.model_mean_type != ModelMeanType.PREVIOUS_X else TN-N+1
+                mask = mask[:,(TN-LEN):,...]
+                model_output = model_output[:,(TN-LEN):,...]
+                target = target[:,:LEN,...]
+
+>>>>>>> merge
             mask = mask.reshape(B * LEN, 1, 1, 1).float()
-            # Merge B and T to treat each patch as一个样本点
             model_output = model_output.reshape(B * LEN, C, PH, PW)
             target = target.reshape(B * LEN, C, PH, PW)
-            terms["mse"] = mean_flat((target - model_output) ** 2) * mask
+            terms["mse"] = mean_flat((target - model_output) ** 2 * mask)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
         else:
             raise NotImplementedError(self.loss_type)
+        self.logging(
+            infos={
+                "x_t_all":x_t_all_ori, 
+                "noise_all":noise_all, 
+                "x_pred_all":from_patch_seq_all(model_output_ori[:, N-1:-1,...], H, W),
+                "model_output":model_output_ori,
+                "terms":terms,
+                "eos_patch":eos_patch
+                }, 
+            log_settings=custom_detailed_log
+        )
 
         return terms
 
