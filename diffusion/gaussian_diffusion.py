@@ -971,12 +971,6 @@ class GaussianDiffusion:
             th.cuda.empty_cache()
         return seq  # (B, L_final, C, P, P)
 
-<<<<<<< HEAD
-
-
-
-=======
->>>>>>> merge
     def ddim_sample(
         self,
         model,
@@ -1264,8 +1258,8 @@ class GaussianDiffusion:
                     th.save(infos["noise_all"],f"{new_dir}/noise_all.pt")
                 if "x_pred_all" in infos:
                     th.save(infos["x_pred_all"],f"{new_dir}/x_pred_all.pt")
-            if log_settings['target_print']:
-                print(f"Saving target to {new_dir}")
+                if "y" in infos:
+                    th.save(infos["y"],f"{new_dir}/y.pt")
                 if "target" in infos:
                     th.save(infos["target"],f"{new_dir}/target.pt")
             if log_settings['loss_analysis']:
@@ -1324,11 +1318,8 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
-<<<<<<< HEAD
             #pdb.set_trace()
-            self.save_generated_images(x_t_all_ori, noise_all, from_patch_seq_all(model_output[:, N-1:-1,...], H, W), x_start.device, save_dir='./check_code')
             
-=======
             model_output_ori = model_output
             """
             #这是预测均值和方差时，此时通道数由3变为6
@@ -1354,7 +1345,6 @@ class GaussianDiffusion:
                     raise NotImplementedError("没看懂这是啥")
                     terms["vb"] *= self.num_timesteps / 1000.0
             """
->>>>>>> merge
             eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, p, p)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
@@ -1381,14 +1371,6 @@ class GaussianDiffusion:
             #pdb.set_trace())
             mask = (t != -1)
             mask = mask.repeat_interleave(TN//mask.shape[1], dim=1)
-<<<<<<< HEAD
-            # reshape 成 (B*TN, 1, 1, 1) broadcast 到 loss tensor
-            LEN = TN if self.model_mean_type != ModelMeanType.PREVIOUS_X else TN-N+1
-            mask = mask[:,(TN-LEN):,...]
-            model_output = model_output[:,(TN-LEN):,...]
-            target = target[:,:LEN,...]
-            #pdb.set_trace()
-=======
 
             # 这个是为了测试，开启时使用真实的x_t[t,i+1]作为output[t,i]的预测目标
             # 关闭时使用q(x_t-1\x_0)，即由x_t-1计算出来的后验分布作为预测目标
@@ -1406,7 +1388,6 @@ class GaussianDiffusion:
                 model_output = model_output[:,(TN-LEN):,...]
                 target = target[:,:LEN,...]
 
->>>>>>> merge
             mask = mask.reshape(B * LEN, 1, 1, 1).float()
             model_output = model_output.reshape(B * LEN, C, PH, PW)
             target = target.reshape(B * LEN, C, PH, PW)
@@ -1424,7 +1405,8 @@ class GaussianDiffusion:
                 "x_pred_all":from_patch_seq_all(model_output_ori[:, N-1:-1,...], H, W),
                 "model_output":model_output_ori,
                 "terms":terms,
-                "eos_patch":eos_patch
+                "eos_patch":eos_patch,
+                "y":model_kwargs['y'] if model_kwargs is not None else None
                 }, 
             log_settings=custom_detailed_log
         )

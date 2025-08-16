@@ -145,7 +145,6 @@ def main(args):
             "log_every": args.detailed_log_every,
             "pic_print": args.detailed_log_pic_print,
             "middle_vars_print": args.detailed_log_middle_vars_print,
-            "target_print": args.detailed_log_target_print,
             "loss_analysis": args.detailed_log_loss_analysis
         }
     else:
@@ -384,7 +383,6 @@ if __name__ == "__main__":
     parser.add_argument("--detailed-log-every", type=int, default=100)
     parser.add_argument("--detailed-log-pic-print", action="store_true")
     parser.add_argument("--detailed-log-middle-vars-print", action="store_true")
-    parser.add_argument("--detailed-log-target-print", action="store_true")
     parser.add_argument("--fixed-sequence", action="store_true")
     parser.add_argument("--use-real-target", action="store_true")
     parser.add_argument("--detailed-log-loss-analysis", action="store_true")
