@@ -8,6 +8,7 @@ import math
 
 import numpy as np
 import torch as th
+import torch.nn.functional as F
 import enum
 import pdb
 import os
@@ -1152,31 +1153,41 @@ class GaussianDiffusion:
                  - 'output': a shape [N] tensor of NLLs or KLs.
                  - 'pred_xstart': the x_0 predictions.
         """
-        import pdb;#pdb.set_trace()
         true_mean, _, true_log_variance_clipped = self.q_all_posterior_mean_variance(
             x_start=x_start, x_t_all=x_t, t=t
         )
         out = self.p_all_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
+        num_patch = self.image_converter.num_patch
+        true_mean_aligned = true_mean[:, :-num_patch]
+        true_logvar_aligned = true_log_variance_clipped[:, :-num_patch]
+        pred_mean_aligned = out["mean"][:, (num_patch-1):-1]
+        pred_logvar_aligned = out["log_variance"][:, (num_patch-1):-1]
         kl = normal_kl(
-            true_mean, true_log_variance_clipped, out["mean"], out["log_variance"]
+            true_mean_aligned,
+            true_logvar_aligned,
+            pred_mean_aligned,
+            pred_logvar_aligned
         )
+
         # kl = mean_flat(kl) / np.log(2.0)
         kl = mean_flat(kl.reshape(kl.shape[0]*kl.shape[1],-1)) / np.log(2.0)
 
-        x_start_expanded = to_patch_seq_all(x_start.unsqueeze(1).expand(-1,t.shape[1],-1,-1,-1), x_t.shape[3])
-        decoder_nll = -discretized_gaussian_log_likelihood(
-            x_start_expanded, means=out["mean"], log_scales=0.5 * out["log_variance"]
-        )
-        assert decoder_nll.shape == x_start_expanded.shape
-        # decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
-        decoder_nll = mean_flat(decoder_nll.reshape(decoder_nll.shape[0]*decoder_nll.shape[1],-1)) / np.log(2.0)
+        # 以下的代码都是说，当t=0时用decoder_nll替换掉kl，但是在我们的模型中暂时不需要这么做所以注释掉
+        # x_start_expanded = to_patch_seq_all(x_start.unsqueeze(1).expand(-1,t.shape[1],-1,-1,-1), x_t.shape[3])
+        # decoder_nll = -discretized_gaussian_log_likelihood(
+        #     x_start_expanded, means=out["mean"], log_scales=0.5 * out["log_variance"]
+        # )
+        # assert decoder_nll.shape == x_start_expanded.shape
+        # # decoder_nll = mean_flat(decoder_nll) / np.log(2.0)
+        # decoder_nll = mean_flat(decoder_nll.reshape(decoder_nll.shape[0]*decoder_nll.shape[1],-1)) / np.log(2.0)
 
-        # At the first timestep return the decoder NLL,
-        # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
-        output = th.where((expand_timesteps_like_patches(x_t,t).reshape(x_t.shape[0]*x_t.shape[1]) == 0), decoder_nll, kl)
-        return {"output": output, "pred_xstart": out["pred_xstart"]}
+        # # At the first timestep return the decoder NLL,
+        # # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
+        # output = th.where((expand_timesteps_like_patches(x_t,t).reshape(x_t.shape[0]*x_t.shape[1]) == 0), decoder_nll, kl)
+        return {"output": kl, "pred_xstart": out["pred_xstart"]}
+
 
     def generate_diffusion_noise_sequence(self, x_start, t):
         """
@@ -1196,28 +1207,32 @@ class GaussianDiffusion:
         # 预分配输出 (B, T, C, H, W)
         x_t_all = th.zeros((B, T_steps, C, H, W), device=device)
         noise_global_all = th.zeros_like(x_t_all)
+    
 
-        for b in range(B):
-            x_0 = x_start[b]
-            x_t = x_start[b]  # (C, H, W)
-            for idx in range(T_steps):
-                cur_step = t[b, idx].item()
-                if cur_step == 0:
-                    x_t_all[b, idx] = x_t
-                    noise_global_all[b, idx] = 0.0  # 没有噪声
-            for step in range(1, self.num_timesteps + 1):
-                noise = th.randn_like(x_t)
-                sqrt_alpha = self.sqrt_alphas[step - 1]
-                sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[step - 1]
-                x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
-                for idx in range(T_steps):
-                    cur_step = t[b, idx].item()
-                    if cur_step == step:
-                        x_t_all[b, idx] = x_t
-                        sqrt_alpha_cum = self.sqrt_alphas_cumprod[step]
-                        sqrt_one_minus_alpha_cum = self.sqrt_one_minus_alphas_cumprod[step]
-                        epsilon_t = (x_t - sqrt_alpha_cum * x_0) / sqrt_one_minus_alpha_cum
-                        noise_global_all[b, idx] = epsilon_t
+        x_0 = x_start
+        x_t = x_start.clone()  # (C, H, W)
+        mask0 = (t == 0)  # (B, T)
+        if mask0.any():
+            # broadcast 到 (B, T, C, H, W)
+            x_t_all[mask0] = x_0.unsqueeze(1).expand(-1, T_steps, -1, -1, -1)[mask0]
+            noise_global_all[mask0] = 0.0
+            
+        for step in range(1, self.num_timesteps + 1):
+            noise = th.randn_like(x_t)
+            sqrt_alpha = self.sqrt_alphas[step - 1]
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alphas[step - 1]
+            x_t = sqrt_alpha * x_t + sqrt_one_minus_alpha * noise
+            # 找出哪些样本在这个 step 需要保存
+            mask = (t == step)  # (B, T)
+            if mask.any():
+                # 保存对应的 x_t
+                x_t_all[mask] = x_t.unsqueeze(1).expand(-1, T_steps, -1, -1, -1)[mask]
+
+                # 计算 epsilon_t
+                sqrt_alpha_cum = self.sqrt_alphas_cumprod[step]
+                sqrt_one_minus_alpha_cum = self.sqrt_one_minus_alphas_cumprod[step]
+                epsilon_t = (x_t - sqrt_alpha_cum * x_0) / sqrt_one_minus_alpha_cum
+                noise_global_all[mask] = epsilon_t.unsqueeze(1).expand(-1, T_steps, -1, -1, -1)[mask]
 
         return x_t_all, noise_global_all
 
@@ -1281,7 +1296,7 @@ class GaussianDiffusion:
                     f.write(f"训练的后验MSE值：{infos['terms']['mse']}\n")
                     f.write(f"和真实值对比计算的MSE值：{real_mse}")
                     
-    def training_losses(self, model, x_start, t, custom_detailed_log, model_kwargs=None):
+    def training_losses(self, model, x_start, t, custom_detailed_log, vae, model_kwargs=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -1316,12 +1331,28 @@ class GaussianDiffusion:
         N = TN // T
         terms = {}
         
+        eos_patch = th.zeros_like(x_t_all[:, 0])
         # ！！！KL Loss and vb loss is not needed for now
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            raise NotImplementedError(self.loss_type)
+            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+            model_output_ori = model_output
+            terms["loss"] = self._vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                x_t=x_t_all,
+                t=t,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+            )["output"]
+            #默认应该走这里，对loss进行放大；但是这是dit为了用单步去训练全局做的放缩，实际上无所谓，这里不乘了
+            if self.loss_type == LossType.RESCALED_KL:
+                terms["loss"] *= t.shape[1]-1
+                
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
             #pdb.set_trace()
+            # x = vae.decode(model_output / 0.18215).sample
+            # model_output = vae.encode(x).latent_dist.sample().mul_(0.18215)
             
             model_output_ori = model_output
             """
@@ -1347,8 +1378,7 @@ class GaussianDiffusion:
                 if self.loss_type == LossType.RESCALED_MSE:
                     raise NotImplementedError("没看懂这是啥")
                     terms["vb"] *= self.num_timesteps / 1000.0
-            """
-            eos_patch = th.zeros_like(model_output[:, 0])  # (B, C, p, p)
+            """  # (B, C, p, p)
             if self.model_mean_type == ModelMeanType.PREVIOUS_X:
                 target = self.q_all_posterior_mean_variance(
                     x_start=x_start, x_t_all=x_t_all, t=t
@@ -1383,6 +1413,7 @@ class GaussianDiffusion:
                     eos_patch.unsqueeze(1)  # (B, 1, C, H, W)
                 ], dim=1)  # (B, TN, C, H, W)
                 LEN = TN
+
             else:
                 # 这里是为了错位：PREVIOUS_X提供的后验分布，每个[t,i]位置算出的后验分布对应位置为[t+1,i]
                 # 而我们希望每个位置对应[t,i+1]，所以target扔掉后N-1个，model_output扔掉前N-1个正好对齐
@@ -1391,10 +1422,21 @@ class GaussianDiffusion:
                 model_output = model_output[:,(TN-LEN):,...]
                 target = target[:,:LEN,...]
 
+            if not self.training_settings['predict_eos_patch']:
+                target = target[:, :-1, ...]
+                mask = mask[:,:-1,...]
+                model_output = model_output[:,:-1,...]
+                LEN = LEN-1
             mask = mask.reshape(B * LEN, 1, 1, 1).float()
             model_output = model_output.reshape(B * LEN, C, PH, PW)
             target = target.reshape(B * LEN, C, PH, PW)
-            terms["mse"] = mean_flat((target - model_output) ** 2 * mask)
+            if self.training_settings['loss_type'] == "MSE":
+                terms["mse"] = mean_flat((target - model_output) ** 2 * mask)
+            elif self.training_settings['loss_type'] == "L1":
+                terms["mse"] = mean_flat(th.abs(target - model_output) * mask)
+            elif self.training_settings['loss_type'] == "huber":
+                loss_per_elem = F.huber_loss(model_output, target, reduction="none", delta=1.0)
+                terms["mse"] = mean_flat(loss_per_elem * mask)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

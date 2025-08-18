@@ -99,7 +99,7 @@ class SpacedDiffusion(GaussianDiffusion):
         return super().condition_score(self._wrap_model(cond_fn), *args, **kwargs)
 
     #！！！新增
-    def training_losses(self, model, x_start, t, custom_detailed_log, model_kwargs=None):
+    def training_losses(self, model, x_start, t, custom_detailed_log, vae, model_kwargs=None):
         # 将缩减时间步映射回原始时间步
         assert t is not None and isinstance(t, th.Tensor)
         mapper = lambda t : np.linspace(0, 999, t + 1).round().astype(int).tolist()
@@ -109,7 +109,7 @@ class SpacedDiffusion(GaussianDiffusion):
         #     mapped_t = th.tensor([self.timestep_map[int(time.item())] for time in t], device=device, dtype=t.dtype)
         
         # 调用父类 training_losses，传入映射后的时间步
-        return super().training_losses(model, x_start, wrapped_t['patched_timesteps'], custom_detailed_log, model_kwargs=model_kwargs)
+        return super().training_losses(model, x_start, wrapped_t['patched_timesteps'], custom_detailed_log, vae, model_kwargs=model_kwargs)
 
     def _wrap_model(self, model):
         if isinstance(model, _WrappedModel):

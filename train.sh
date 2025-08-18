@@ -1,23 +1,25 @@
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup torchrun  \
+CUDA_VISIBLE_DEVICES=0 nohup torchrun  \
 --nnodes=1 \
---nproc_per_node=4  \
+--nproc_per_node=1 --master_port=29509 \
 train.py \
 --model DiT-L/4 \
---global-batch-size 16 \
+--global-batch-size 8 \
 --data-path /data0/lmy/imagenette2/train \
---num-classes 10 \
+--num-classes 1000 \
 --max_gen_len 1000 \
---epochs 100 \
---ckpt-every 1000 \
---detailed-log-every 1000 \
+--epochs 5 \
+--ckpt-every 500 \
+--detailed-log-every 500 \
 --detailed-log-pic-print \
 --detailed-log-middle-vars-print \
---use-real-target \
---results-dir /data3/xdk/dit-results \
+--rand-t 20 \
+--loss-type KL \
+--results-dir /data3/xdk/loss-type-check \
 --vae-path "/data0/dit-assets/sd-vae-ft-ema" \
---description "1g dataset, unfixed sequence, print all middle vars, Use real next patch as target" \
-> ./training_log.txt 2>&1 &
+--description "KL loss type test; 1g dataset, unfixed sequence, print all middle vars; don't predict eos patch; t = 20" \
+> ./training_log_KL.txt 2>&1 &
 
+# --use-real-target \
 # --detailed-log-loss-analysis \
 # --detailed-log-middle-vars-print \
 # --vae-path "/data0/dit-assets/sd-vae-ft-ema" \

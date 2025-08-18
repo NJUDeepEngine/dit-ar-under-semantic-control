@@ -40,17 +40,33 @@ from diffusers.models import AutoencoderKL
 #                             Training Helper Functions                         #
 #################################################################################
 
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """
-    Step the EMA model towards the current model.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
 
-    for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+def check_trainable_parameters(model, logger=None):
+    """
+    Check and log which parameters are trainable in the model.
+    """
+    total_params = 0
+    trainable_params = 0
+    frozen_params = 0
+    
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+        else:
+            frozen_params += param.numel()
+            if logger:
+                logger.info(f"Frozen parameter: {name} (shape: {param.shape})")
+    
+    if logger:
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+        logger.info(f"Frozen parameters: {frozen_params:,}")
+        logger.info(f"Trainable ratio: {trainable_params/total_params*100:.2f}%")
+    
+    return trainable_params, frozen_params, total_params
+
+
 
 
 def requires_grad(model, flag=True):
@@ -173,17 +189,30 @@ def main(args):
     
     custom_training_settings = {
         "fixed_sequence": args.fixed_sequence,  
-        "use_real_target": args.use_real_target
+        "use_real_target": args.use_real_target,
+        "predict_eos_patch": args.predict_eos_patch,
+        "loss_type": args.loss_type
     }
 
-    ema = deepcopy(model).to(device)
-    requires_grad(ema, False)
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
     image_converter = ImageConverter(h=latent_size, w=latent_size, patch_size=model.patch_size, vae=vae)
     model = DDP(model.to(device), device_ids=[device])
-    diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000,image_converter=image_converter, training_settings = custom_training_settings)
+    diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000,image_converter=image_converter, training_settings = custom_training_settings, use_kl = args.loss_type == "KL")
     # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    
+    # 检查模型参数的可训练性
+    logger.info("=== DiT Model Parameter Analysis ===")
+    check_trainable_parameters(model.module, logger)  # 使用model.module来访问原始模型
+    
+    # 确保所有参数都是可训练的
+    requires_grad(model, True)
+    logger.info("=== After ensuring all parameters are trainable ===")
+    check_trainable_parameters(model.module, logger)
+
+    requires_grad(vae, False)
+
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
     
@@ -199,7 +228,6 @@ def main(args):
         map_loc = {"cuda:%d" % 0: "cuda:%d" % device}  # 兼容跨卡加载
         ckpt = torch.load(args.resume_ckpt, map_location=lambda storage, loc: storage.cuda(device))
         model.module.load_state_dict(ckpt["model"])
-        ema.load_state_dict(ckpt["ema"])
         opt.load_state_dict(ckpt["opt"])
 
         # 恢复步数/epoch（如果老 ckpt 没存，就从文件名猜一把）
@@ -263,11 +291,7 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    if args.resume_ckpt is None:
-        update_ema(ema, model.module, decay=0)
     model.train()
-    ema.eval()
-
     # Variables for monitoring/logging purposes:
     #train_steps = 0
     log_steps = 0
@@ -284,19 +308,18 @@ def main(args):
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 check_x=vae.decode(x / 0.18215).sample
-            rand_t = 100
+            rand_t = args.rand_t
             t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)
 
             model_kwargs = dict(y=y)
             # 计算当前batch的损失
 
-            loss_dict = diffusion.training_losses(model, x, t, custom_logger_setting, model_kwargs)
+            loss_dict = diffusion.training_losses(model, x, t, custom_logger_setting, vae, model_kwargs)
             loss = loss_dict["loss"].mean()
 
             opt.zero_grad()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
 
             # 记录损失值
             running_loss += loss.item()
@@ -332,7 +355,6 @@ def main(args):
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
                         "train_steps": train_steps,
@@ -383,9 +405,12 @@ if __name__ == "__main__":
     parser.add_argument("--detailed-log-every", type=int, default=100)
     parser.add_argument("--detailed-log-pic-print", action="store_true")
     parser.add_argument("--detailed-log-middle-vars-print", action="store_true")
+    parser.add_argument("--detailed-log-loss-analysis", action="store_true")
     parser.add_argument("--fixed-sequence", action="store_true")
     parser.add_argument("--use-real-target", action="store_true")
-    parser.add_argument("--detailed-log-loss-analysis", action="store_true")
+    parser.add_argument("--predict-eos-patch", action="store_true")
+    parser.add_argument("--rand-t", type=int, default=100)
+    parser.add_argument("--loss-type", type=str, default="MSE")
     args = parser.parse_args()
     main(args)
 """

@@ -18,6 +18,8 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    # print(x.shape, shift.shape, scale.shape)
+    # return x * (1 + scale) + shift
 
 
 #################################################################################
@@ -249,6 +251,9 @@ class DiT(nn.Module):
         token_input = x + pos  # (B, LEN, D)
         #t=self.t_embedder(t)  # (B, D)
         y= self.y_embedder(y, self.training)
+        #modified by xjw
+        # y = y.unsqueeze(1).expand(-1, LEN, -1)  # (B, LEN, D)
+        # y = y + pos  # 叠加位置编码
         cond=y
         for block in self.blocks:
             token_input = block(token_input, cond)  # (B, LEN, D)
