@@ -25,7 +25,7 @@ with torch.no_grad():
     ctx_seq.append(cur_prefix)        # (B, p0, C, ps, ps)
 
 ctx = torch.cat(ctx_seq, dim=1)       # (B, K_time*P + p0, C, ps, ps)
-ctx = ctx.detach()                    # 历史部分在帧边界截断
+ctx = ctx.detach()                    # 历史部分在帧边界截断 
 
 # 2) 窗口内 K_patch 步：在“当前帧”从 p0 开始自喂，逐步预测 p0..p0+K_patch-1
 loss = 0.0
