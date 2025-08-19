@@ -40,6 +40,18 @@ from diffusers.models import AutoencoderKL
 #                             Training Helper Functions                         #
 #################################################################################
 
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
 
 def check_trainable_parameters(model, logger=None):
     """
@@ -195,6 +207,8 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     )
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
     
     custom_training_settings = {
         "fixed_sequence": args.fixed_sequence,  
@@ -302,9 +316,10 @@ def main(args):
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
-
+    update_ema(ema, model.module, decay=0)
     # Prepare models for training:
     model.train()
+    ema.eval()
     # Variables for monitoring/logging purposes:
     #train_steps = 0
     log_steps = 0
@@ -322,8 +337,9 @@ def main(args):
                 latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
             rand_t = args.rand_t
             t = torch.full((latent.shape[0],), rand_t, device=device, dtype=torch.long)
-
-            model_kwargs = dict(y=y)
+            
+            return_last= True if args.use_ss else False
+            model_kwargs = dict(y=y,return_last=return_last) 
             # 计算当前batch的损失
             opt.zero_grad(set_to_none=True)
             
@@ -386,7 +402,7 @@ def main(args):
             loss = loss_dict["loss"].mean()
             loss.backward()
             opt.step()
-
+            update_ema(ema, model.module)
             # 记录损失值
             running_loss += loss.detach().item()
             log_steps += 1
@@ -421,6 +437,7 @@ def main(args):
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
                         "train_steps": train_steps,

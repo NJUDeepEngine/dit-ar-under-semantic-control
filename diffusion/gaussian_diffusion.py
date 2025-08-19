@@ -1290,6 +1290,312 @@ class GaussianDiffusion:
 
         return terms
     
+
+    def ss_training_losses(self, model, x_start, t, custom_detailed_log, vae, model_kwargs=None,ss_settings=None):
+        """
+        Compute training losses for a single timestep.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param t: [N x T], a sequence of timesteps onuse for each picture.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param noise: if specified, the specific Gaussian noise to try to remove.
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+                 Some mean or variance settings may also have other keys.
+        """
+        
+        if model_kwargs is None:
+            model_kwargs = {}
+        assert t is not None
+        if isinstance(t, int):
+            t = th.tensor([t] * x_start.shape[0], device=x_start.device)
+
+        self.step_count += 1
+        if self.training_settings['fixed_sequence']:
+            if self.step_count == 1:
+                self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
+                th.save(self.memory_seq[0], os.path.join(custom_detailed_log['folder'],"saved_x_t_all.pt"))
+            x_t_all_ori,noise_all = self.memory_seq
+        else:
+            x_t_all_ori,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
+
+        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
+        
+        B, TN, C, PH, PW = x_t_all.shape
+        _, T, _, H, W = x_t_all_ori.shape
+        N = TN // T
+        terms = {}
+        x_t_teacher = x_t_all.clone()
+        eos_patch = th.zeros_like(x_t_all[:, 0])
+        # ------ 读取超参 ------
+        ksu_cfg = (ss_settings or {}).get("ksu", {})
+        ss_cfg  = (ss_settings or {}).get("ss", {})
+        K       = int(ksu_cfg.get("K", 0))
+        p_batch = float(ksu_cfg.get("batch_enable_prob", 1.0))
+        num_t0  = int(ksu_cfg.get("num_t0", 1))          # << 新增：一次加噪里采几个 t0
+        p_ss     = float(ss_cfg.get("p", 0.0))
+
+        # ------ 可选：如果这一步不想开 KSU，直接回退到单 t0，也能跑 ------
+        enable_ksu_this_batch = (K > 0) and (th.rand((), device=x_t_all.device).item() < p_batch)
+        if not enable_ksu_this_batch:
+            num_t0 = 1  # 只做一次 roll-in（仍然能跑完整训练）
+
+        # ------ 预计算：给 SS 用的 base 预测（在“干净序列”上，只算一次） ------
+        pred_all_base = None
+        if p_ss > 0.0:
+            was_training = model.training
+            model.eval()
+            with th.no_grad():
+                pred_all_base = model(x_t_all, **(model_kwargs))  # (B, TN, C, PH, PW)
+            if was_training: model.train()
+            pred_all_base = pred_all_base.detach()
+            # 与一步目标对齐：用 pred[:, i-1] 替换 x[:, i]
+            pred_shift_base = th.cat([x_t_all[:, :1, ...], pred_all_base[:, :-1, ...]], dim=1)
+        else:
+            pred_shift_base = None
+
+        losses = []
+
+        # ------ 采样 num_t0 个起点（去重避免浪费；边界 [64, TN-1]） ------
+        low, high = N, TN  # randint 上界是开区间
+        if high <= low:
+            t0_list = [N]  # 保障
+        else:
+            # 允许重复也没关系；要去重可用 unique_consecutive 或 set
+            t0_list = th.randint(low=low, high=high, size=(num_t0,), device=x_t_all.device).tolist()
+
+        for t0 in t0_list:
+            # 每个 t0 都从“干净序列”拷贝一份
+            seq = x_t_all.clone()
+
+            # ------- A) SS：只在 [64, t0-8) 做（roll-in，无梯度） -------
+            if p_ss > 0.0:
+                ss_end = max(N, t0 - 8)  # 右开区间
+                if ss_end > N:
+                    L = ss_end - N
+                    ss_mask = (th.rand(B, L, 1, 1, 1, device=seq.device) < p_ss)
+                    seg = seq[:, N:ss_end, ...]
+                    seg = th.where(ss_mask, pred_shift_base[:, N:ss_end, ...], seg)
+                    seq = th.cat([seq[:, :N, ...], seg, seq[:, ss_end:, ...]], dim=1)
+
+            # ------- B) KSU：从 t0 向后滚 K 步（允许跨帧；越界提前停；roll-in，无梯度） -------
+            if enable_ksu_this_batch and K > 0:
+                was_training = model.training
+                model.eval()
+                j_stop = min(t0 + K - 1, TN - 2)  # 确保写回 j+1 不越界
+                for j in range(t0, j_stop + 1):
+                    with th.no_grad():
+                        pred_step = model(seq, **(model_kwargs or {}))  # (B, TN, C, PH, PW)
+                    # 对齐“一步目标”：pred[:, j] 写回到输入的 j+1
+                    seq[:, j + 1, ...] = pred_step[:, j, ...].detach()
+                if was_training: model.train()
+
+            # ------- C) 这一次“带梯度”的前向：用 seq 算 loss -------
+            model_output = model(seq, **model_kwargs)  # (B, TN, C, PH, PW)
+
+            # === 按你原先的 target 逻辑（use_real_target 分支） ===
+            if self.training_settings['use_real_target']:
+                target = th.cat([x_t_teacher[:, 1:], eos_patch.unsqueeze(1)], dim=1)  # teacher！
+                LEN = TN
+            else:
+                # 如果用 posterior/noise 目标，也要把 x_t_all 换回 x_t_teacher
+                assert 0
+
+            # 可选：不预测 EOS 就裁掉末尾
+            model_out_use = model_output
+            target_use = target
+            if not self.training_settings['predict_eos_patch']:
+                model_out_use = model_out_use[:, :-1, ...]
+                target_use    = target_use[:, :-1, ...]
+                LEN -= 1
+
+            # mask（你原来未定义，这里给全 1；需要可替换）
+            
+
+            model_out_use = model_out_use.reshape(B * LEN, C, PH, PW)
+            target_use    = target_use.reshape(B * LEN, C, PH, PW)
+
+            if self.training_settings['loss_type'] == "MSE":
+                loss_m = mean_flat((target_use - model_out_use) ** 2)
+            elif self.training_settings['loss_type'] == "L1":
+                loss_m = mean_flat(th.abs(target_use - model_out_use))
+            else:
+                loss_per_elem = F.huber_loss(model_out_use, target_use, reduction="none", delta=1.0)
+                loss_m = mean_flat(loss_per_elem )
+
+            losses.append(loss_m)
+
+        # ------ 汇总：多个 t0 的 loss 取平均（保持学习率语义） ------
+        terms["mse"]  = th.stack(losses).mean()
+        terms["loss"] = terms["mse"]
+        self.logging(
+            infos={
+                "x_t_all":x_t_all_ori, 
+                "noise_all":noise_all, 
+                "terms":terms,
+                "eos_patch":eos_patch,
+                "y":model_kwargs['y'] if model_kwargs is not None else None
+                }, 
+            log_settings=custom_detailed_log
+        )
+        return terms
+    def all_kstep_ss_training_losses(self, model, x_start, t, custom_detailed_log, vae,
+                       model_kwargs=None, ss_settings=None):
+        """
+        Per-step supervision 版本：
+        - SS:   只在 [64, t0-8) 做（roll-in, no_grad, detach）
+        - KSU:  从 t0 起逐步 roll-in，每步“带梯度”前向只监督当前 j 位；然后把 pred[:, j].detach() 写回 seq[:, j+1]
+        - 最终 loss = 所有 (t0, j) 的 loss_j 取平均
+        """
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        assert t is not None
+        if isinstance(t, int):
+            t = th.tensor([t] * x_start.shape[0], device=x_start.device)
+
+        # ===== 生成加噪序列 =====
+        self.step_count += 1
+        if self.training_settings['fixed_sequence']:
+            if self.step_count == 1 and custom_detailed_log:
+                self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
+                try:
+                    th.save(self.memory_seq[0],
+                            os.path.join(custom_detailed_log['folder'], "saved_x_t_all.pt"))
+                except Exception:
+                    pass
+            x_t_all_ori, noise_all = self.memory_seq
+        else:
+            x_t_all_ori, noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
+
+        # (B, T, C, H, W) -> 展平为 (B, TN, C, PH, PW)
+        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size)
+
+        B, TN, C, PH, PW = x_t_all.shape
+        _, T, _, H, W = x_t_all_ori.shape
+        N = TN // T
+
+        terms = {}
+        x_t_teacher = x_t_all.clone()                 # 教师序列（构造 targets 用）
+        eos_patch = th.zeros_like(x_t_all[:, 0])
+
+        # ===== 读取超参 =====
+        ksu_cfg = (ss_settings or {}).get("ksu", {})
+        ss_cfg  = (ss_settings or {}).get("ss", {})
+
+        K        = int(ksu_cfg.get("K", 0))
+        p_batch  = float(ksu_cfg.get("batch_enable_prob", 1.0))
+        num_t0   = int(ksu_cfg.get("num_t0", 1))
+        p_ss     = float(ss_cfg.get("p", 0.0))
+
+        enable_ksu_this_batch = (K > 0) and (th.rand((), device=x_t_all.device).item() < p_batch)
+        if not enable_ksu_this_batch:
+            num_t0 = 1  # 退化为只监督 1 步（j=t0），仍可训练
+
+        # ===== 预计算：SS 的 base 预测（只做一次） =====
+        pred_shift_base = None
+        if p_ss > 0.0:
+            was_training = model.training
+            model.eval()
+            with th.no_grad():
+                pred_all_base = model(x_t_all, **(model_kwargs or {}))  # (B, TN, C, PH, PW)
+            if was_training: model.train()
+            pred_all_base = pred_all_base.detach()
+            # 对齐一步目标：用 i-1 的预测替换 i 的输入
+            pred_shift_base = th.cat([x_t_all[:, :1, ...], pred_all_base[:, :-1, ...]], dim=1)
+
+        # ===== 采样 t0 列表（允许重复；想无放回可改 randperm） =====
+        low, high = N, TN
+        if high <= low:
+            t0_list = [N]
+        else:
+            t0_list = th.randint(low=low, high=high, size=(num_t0,), device=x_t_all.device).tolist()
+
+        per_step_losses = []   # 累加 (t0, j) 的 loss_j
+
+        for t0 in t0_list:
+            # 从干净序列拷贝一份作为 roll-in 的工作副本
+            seq = x_t_all.clone()
+
+            # ===== A) SS：只在 [64, t0-8) 做（roll-in, no_grad, detach）=====
+            if p_ss > 0.0:
+                ss_end = max(N, t0 - 8)      # 右开
+                if ss_end > N:
+                    L = ss_end - N
+                    ss_mask = (th.rand(B, L, 1, 1, 1, device=seq.device) < p_ss)
+                    seg = seq[:, N:ss_end, ...]
+                    seg = th.where(ss_mask, pred_shift_base[:, N:ss_end, ...], seg)
+                    seq = th.cat([seq[:, :N, ...], seg, seq[:, ss_end:, ...]], dim=1)
+
+            # ===== B) KSU：从 t0 起逐步监督 =====
+            # j+1 不能越界，所以 j <= TN-2
+            j_stop = min(t0 + (K if enable_ksu_this_batch else 1) - 1, TN - 2)
+
+            for j in range(t0, j_stop + 1):
+                # 如果不预测 EOS，且 target 是 EOS（j+1==TN-1），则跳过本步监督
+                if (not self.training_settings['predict_eos_patch']) and (j == TN - 2):
+                    # 仍然需要写回，保持 roll-in 轨迹一致
+                    pred_all = model(seq, **(model_kwargs or {}))
+                    with th.no_grad():
+                        seq[:, j + 1, ...] = pred_all[:, j, ...].detach()
+                    continue
+
+                # -- 带梯度前向（训练态）：得到整个序列的预测 --
+                pred_all = model(seq, **(model_kwargs or {}))  # (B, TN, C, PH, PW)
+
+                # -- 取出 j 位的预测与目标 --
+                pred_j   = pred_all[:, j, ...]                 # (B, C, PH, PW)
+                if self.training_settings['use_real_target']:
+                    target_j = x_t_teacher[:, j + 1, ...]      # 一步目标（teacher）
+                else:
+                    # 如需 posterior/noise 目标，这里按你的实现构造 j+1 的 target
+                    assert 0, "Only use_real_target=True is implemented in per-step mode."
+
+                # -- 计算该步损失 --
+                if self.training_settings['loss_type'] == "MSE":
+                    loss_j = ((target_j - pred_j) ** 2).flatten(1).mean(dim=1).mean()
+                elif self.training_settings['loss_type'] == "L1":
+                    loss_j = th.abs(target_j - pred_j).flatten(1).mean(dim=1).mean()
+                else:
+                    loss_per_elem = F.huber_loss(pred_j, target_j, reduction="none", delta=1.0)
+                    loss_j = loss_per_elem.flatten(1).mean(dim=1).mean()
+
+                per_step_losses.append(loss_j)
+
+                # -- 喂回到 j+1（roll-in, detach） --
+                with th.no_grad():
+                    seq[:, j + 1, ...] = pred_j.detach()
+
+        # ===== 汇总所有 (t0, j) 的 loss，取平均 =====
+        if len(per_step_losses) == 0:
+            # 极端情况下（例如都被 EOS 跳过），返回 0 loss 以避免 NaN
+            loss_total = th.tensor(0.0, device=x_t_all.device, dtype=x_t_all.dtype)
+        else:
+            loss_total = th.stack(per_step_losses).mean()
+
+        terms["mse"]  = loss_total
+        terms["loss"] = loss_total
+
+        # ===== 安全日志（可选）=====
+        if custom_detailed_log:
+            infos = {
+                "x_t_all": x_t_all_ori,
+                "noise_all": noise_all,
+                "terms": terms,
+                "eos_patch": eos_patch,
+                "y": model_kwargs.get('y') if model_kwargs is not None else None
+            }
+            try:
+                # 选一份可视化预测：最后一次 pred_all（若存在），否则跳过
+                if 'pred_all' in locals() and pred_all is not None:
+                    # 这里用一个窗口示意（N-1:-1）；你也可以挑一小段，避免日志过大
+                    infos["x_pred_all"] = from_patch_seq_all(pred_all[:, max(N-1, 0):-1, ...], H, W)
+                    infos["model_output"] = pred_all
+            except Exception:
+                pass
+            self.logging(infos=infos, log_settings=custom_detailed_log)
+
+        return terms
     def ddim_sample(
         self,
         model,

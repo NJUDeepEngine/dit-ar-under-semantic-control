@@ -235,7 +235,7 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
     
     ###!!! todo
-    def forward(self, x,y, is_training=True):
+    def forward(self, x,y, return_last=False):
         """
         x: (B, LEN, C, P, P)
         y: (B,)
@@ -261,7 +261,7 @@ class DiT(nn.Module):
         out_token = self.final_layer(token_input, cond)  # (B, LEN, C*P*P)
         out_token = out_token.view(B, LEN, self.out_channels, P, P)
 
-        if not is_training:
+        if return_last:
             return out_token[:, -1:]  # (B, 1, C, P, P)
         return out_token  # (B, LEN, C, P, P)
     
