@@ -126,6 +126,15 @@ def center_crop_arr(pil_image, image_size):
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
+def linear_schedule(step, start_step, end_step, start_val, end_val):
+    if end_step <= start_step:
+        return end_val
+    if step <= start_step:
+        return start_val
+    if step >= end_step:
+        return end_val
+    r = (step - start_step) / float(end_step - start_step)
+    return start_val + r * (end_val - start_val)
 
 def main(args):
     """
@@ -193,8 +202,12 @@ def main(args):
         "predict_eos_patch": args.predict_eos_patch,
         "loss_type": args.loss_type
     }
+    
 
     vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad_(False)
     image_converter = ImageConverter(h=latent_size, w=latent_size, patch_size=model.patch_size, vae=vae)
     model = DDP(model.to(device), device_ids=[device])
     diffusion = create_diffusion(timestep_respacing="",diffusion_steps=1000,image_converter=image_converter, training_settings = custom_training_settings, use_kl = args.loss_type == "KL")
@@ -306,23 +319,76 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-                check_x=vae.decode(x / 0.18215).sample
+                latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
             rand_t = args.rand_t
-            t = torch.full((x.shape[0],), rand_t, device=device, dtype=torch.long)
+            t = torch.full((latent.shape[0],), rand_t, device=device, dtype=torch.long)
 
             model_kwargs = dict(y=y)
             # 计算当前batch的损失
+            opt.zero_grad(set_to_none=True)
+            
 
-            loss_dict = diffusion.training_losses(model, x, t, custom_logger_setting, vae, model_kwargs)
+            k1 = getattr(args, "ksu_k1_step", 20_000)   # K=2 -> 4 的切换步
+            k2 = getattr(args, "ksu_k2_step", 60_000)   # K=4 -> 8 的切换步
+            K_max_default = getattr(args, "ksu_k_max", 8)
+
+            # K 的课程式调度
+            if train_steps < k1:
+                K_cur = 2
+            elif train_steps < k2:
+                K_cur = 4
+            else:
+                K_cur = K_max_default
+            # 可选：并不是每个 batch 都开 KSU，先 50% -> 100%
+            ksu_batch_prob = linear_schedule(
+                step=train_steps,
+                start_step=0,
+                end_step=k1,
+                start_val=0.5,
+                end_val=1.0
+            )
+
+            # 历史帧 SS 概率：0 -> p_end，线性到位（默认 60k 步达顶）
+            ss_end_step = getattr(args, "ss_end_step", 60_000)
+            ss_p_end    = getattr(args, "ss_p_end", 0.35)  # 0.3~0.4 常用；先 0.35
+            p_ss = linear_schedule(
+                step=train_steps,
+                start_step=0,
+                end_step=ss_end_step,
+                start_val=0.0,
+                end_val=ss_p_end
+            )
+
+            # （可选）最近历史帧稍微更“脏”一点；不想用就设为 1.0
+            near_frame_boost = getattr(args, "ss_near_boost", 1.25)
+            p_ss_near = min(0.5, p_ss * near_frame_boost)   # 限到 0.5，稳一些
+          
+
+            ss_settings = {
+                "ksu": {
+                    "K": int(K_cur),                 # 当前 K
+                    "batch_enable_prob": float(ksu_batch_prob),
+                    "t0_strategy": "uniform_0_to_63_minus_K",
+                    "detach_feedback": True,         # 仍然建议 detach
+                },
+                "ss": {
+                    "enable": True,
+                    "scope": "past_frames",
+                    "p": float(p_ss),
+                    "p_near": float(p_ss_near),
+                    "detach_feedback": True,         # 同样 detach
+                }
+            }
+            if not args.use_ss:
+                loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
+            else:
+                loss_dict = diffusion.ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             loss = loss_dict["loss"].mean()
-
-            opt.zero_grad()
             loss.backward()
             opt.step()
 
             # 记录损失值
-            running_loss += loss.item()
+            running_loss += loss.detach().item()
             log_steps += 1
             train_steps += 1
 
@@ -411,6 +477,7 @@ if __name__ == "__main__":
     parser.add_argument("--predict-eos-patch", action="store_true")
     parser.add_argument("--rand-t", type=int, default=100)
     parser.add_argument("--loss-type", type=str, default="MSE")
+    parser.add_argument("--use_ss",action="store_true")
     args = parser.parse_args()
     main(args)
 """

@@ -1,11 +1,23 @@
-CUDA_VISIBLE_DEVICES=0 nohup torchrun  \
+#!/bin/bash
+
+# 默认：不使用 nohup
+USE_NOHUP=false
+
+# 如果传入 --nohup 就启用
+for arg in "$@"; do
+    if [ "$arg" == "--nohup" ]; then
+        USE_NOHUP=true
+    fi
+done
+
+CMD="CUDA_VISIBLE_DEVICES=0 torchrun \
 --nnodes=1 \
 --nproc_per_node=1 --master_port=29509 \
 train.py \
 --model DiT-L/4 \
 --global-batch-size 8 \
 --data-path /data0/lmy/imagenette2/train \
---num-classes 1000 \
+--num-classes 10 \
 --max_gen_len 1000 \
 --epochs 5 \
 --ckpt-every 500 \
@@ -13,11 +25,21 @@ train.py \
 --detailed-log-pic-print \
 --detailed-log-middle-vars-print \
 --rand-t 20 \
---loss-type KL \
+--loss-type huber \
+--use-real-target \
+--use_ss \
 --results-dir /data3/xdk/loss-type-check \
---vae-path "/data0/dit-assets/sd-vae-ft-ema" \
---description "KL loss type test; 1g dataset, unfixed sequence, print all middle vars; don't predict eos patch; t = 20" \
-> ./training_log_KL.txt 2>&1 &
+--vae-path '/data0/dit-assets/sd-vae-ft-ema' \
+--description 'KL loss type test; 1g dataset, unfixed sequence, print all middle vars; do not predict eos patch; t = 20'"
+
+if $USE_NOHUP; then
+    echo "Running with nohup..."
+    nohup $CMD > ./training_log_KL.txt 2>&1 &
+else
+    echo "Running in foreground..."
+    $CMD
+fi
+
 
 # --use-real-target \
 # --detailed-log-loss-analysis \
