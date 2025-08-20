@@ -57,17 +57,16 @@ def main(args):
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     
-    data = torch.load("debug_inputs.pt", map_location="cpu")
+    x = torch.load("/data3/lmy/ss_ksu_result/single_step/11500/x_t_all.pt", map_location="cpu")
 
     # 取出 x 和 y
-    x = data["x"]   # (B, LEN, C, P, P)
-    y = data["y"]   # (B,)
-    #pdb.set_trace()
-    x=x[:,:64]
+    y = torch.load("/data3/lmy/ss_ksu_result/single_step/11500/y.pt", map_location="cpu")  # (B,)
     x=x.to(device)
     y=y.to(device)
+    x=x[:,:1]
     #x_t_all=to_patch_seq_all(x,args.patch_size)
-    #x = x_t_all.to(device)
+    x = x.to(device)
+    x=to_patch_seq_all(x,args.patch_size)
     #pdb.set_trace()
     #class_labels = [10,100,200,300,400,500,600,700,800,900]
     #y = torch.tensor(class_labels, device=device)
@@ -111,10 +110,12 @@ def main(args):
     z_start=x.clone()
     print(z_start.shape)
     #pdb.set_trace()
+    
+    #pdb.set_trace()
     #y_null = torch.tensor([1000] * n, device=device)
     #y = torch.cat([y, y_null], 0)
     #model_kwargs = dict(y=y, is_training=False,cfg_scale=args.cfg_scale)
-    model_kwargs = dict(y=y, is_training=False)
+    model_kwargs = dict(y=y, return_last=True)
     # Sample images:
     #samples = diffusion.p_sample_loop(
     #    model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
@@ -139,12 +140,12 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
-    parser.add_argument("--num-sampling-steps", type=int, default=100)
+    parser.add_argument("--num-sampling-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--patch-size",type=int,default=4)
-    parser.add_argument("--max-step",type=int,default=100)
+    parser.add_argument("--max-step",type=int,default=20)
     parser.add_argument("--out-channels",type=int,default=4)
     #parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--global-batch-size", type=int, default=4)
