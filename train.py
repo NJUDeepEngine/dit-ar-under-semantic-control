@@ -338,7 +338,7 @@ def main(args):
             rand_t = args.rand_t
             t = torch.full((latent.shape[0],), rand_t, device=device, dtype=torch.long)
             
-            return_last= True if args.use_ss else False
+            return_last= False
             model_kwargs = dict(y=y,return_last=return_last) 
             # 计算当前batch的损失
             opt.zero_grad(set_to_none=True)
@@ -386,6 +386,7 @@ def main(args):
                     "batch_enable_prob": float(ksu_batch_prob),
                     "t0_strategy": "uniform_0_to_63_minus_K",
                     "detach_feedback": True,         # 仍然建议 detach
+                    "num_t0":6,
                 },
                 "ss": {
                     "enable": True,
@@ -398,6 +399,7 @@ def main(args):
             if not args.use_ss:
                 loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
             else:
+                #print("use ss and ksu training style")
                 loss_dict = diffusion.ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             loss = loss_dict["loss"].mean()
             loss.backward()
