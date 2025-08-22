@@ -10,17 +10,17 @@ for arg in "$@"; do
     fi
 done
 
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=0
 
 # 使用数组构建命令
 CMD=(
     torchrun
     --nnodes=1
-    --nproc_per_node=2
+    --nproc_per_node=1
     --master_port=29502
     train_copy.py
     --model DiT-L/4
-    --global-batch-size 8
+    --global-batch-size 4
     --data-path /data0/lmy/imagenette2/train
     --num-classes 10
     --epochs 7

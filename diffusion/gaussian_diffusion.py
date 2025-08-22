@@ -23,7 +23,6 @@ def mean_flat(tensor):
     """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
-
 class ModelMeanType(enum.Enum):
     """
     Which type of output the model predicts.
@@ -1287,7 +1286,35 @@ class GaussianDiffusion:
         )
 
         return terms
-    
+    def apply_epsilon_scale(self, loss: th.Tensor, t: th.LongTensor):
+        B, TN, C, P, _ = loss.shape
+        device = loss.device
+
+        # 保证 alphas_cumprod 是 torch.Tensor，并放到正确的 device
+        if not isinstance(self.alphas_cumprod, th.Tensor):
+            self.alphas_cumprod = th.as_tensor(self.alphas_cumprod, dtype=th.float32, device=device)
+        else:
+            self.alphas_cumprod = self.alphas_cumprod.to(device)
+
+        # 索引
+        bar_alpha_t = self.alphas_cumprod[t]  # (B, T)
+        sigma_t = th.sqrt(1.0 - bar_alpha_t)  # (B, T)
+
+        N = self.image_converter.num_patch
+        sigma_t = sigma_t.unsqueeze(-1).repeat(1, 1, N)  # (B, T, N)
+        sigma_t = sigma_t.view(t.shape[0], -1, 1, 1, 1)  # (B, TN, 1, 1, 1)
+        sigma_t_expanded = sigma_t.expand(-1, -1, C, P, P)  # (B, TN, C, P, P)
+
+        if N * t.shape[1] == TN:
+            sigma_t_expanded = th.cat([
+                sigma_t_expanded[:, 1:],  # shift
+                th.zeros_like(sigma_t_expanded[:, 0]).unsqueeze(1)
+            ], dim=1)
+        else:
+            sigma_t_expanded = sigma_t_expanded[:, :loss.shape[1]]
+
+        return loss / (sigma_t_expanded ** 2)
+  
 
     def ss_training_losses(
         self, model, x_start, t, custom_detailed_log, vae,
@@ -1422,15 +1449,20 @@ class GaussianDiffusion:
 
             # 根据 loss_type 计算
             if self.training_settings['loss_type'] == "MSE":
-                loss_m = mean_flat((target_use - model_out_use) ** 2)
+                loss_m = (target_use - model_out_use) ** 2
             elif self.training_settings['loss_type'] == "L1":
-                loss_m = mean_flat(th.abs(target_use - model_out_use))
+                loss_m = th.abs(target_use - model_out_use)
             else:
-                loss_per_elem = F.huber_loss(
+                loss_m = F.huber_loss(
                     model_out_use, target_use, reduction="none", delta=1.0
                 )
-                loss_m = mean_flat(loss_per_elem)
-
+            
+            loss_m=loss_m.reshape(B,LEN,C,PH,PW)
+            pdb.set_trace()
+            loss_m=self.apply_epsilon_scale(loss_m,t)
+            pdb.set_trace()
+            loss_m=mean_flat(loss_m)
+            pdb.set_trace()
             losses.append(loss_m)
 
         # ----------- 5. 汇总 -----------
