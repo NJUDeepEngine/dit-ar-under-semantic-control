@@ -863,33 +863,27 @@ class GaussianDiffusion:
         self.save_image_lmy(picture_0, f"a_0") 
 
         new_z = from_patch_seq_all(z_start.clone(), H, W)
-        last_xt=new_z.clone()
+        last_xt=new_z[:,:1,].clone()
         it = range(1,L0-num_patch+1)
         kw = {} if model_kwargs is None else dict(model_kwargs)
         y=kw.pop("y", None)
-        model_kwargs_ = dict(y=y, is_training=True)
+        model_kwargs_ = dict(y=y, return_last=False)
         model_all_out=model(z_start,**model_kwargs_)
-        
         terms={}
         target=z_start[:,-num_patch:]
         predicted_x_0=model_all_out[:,-num_patch-1:-1]
-
         target = target.flatten(0, 1) 
         model_output=predicted_x_0.flatten(0, 1) 
         terms["mse"] = mean_flat((target - model_output) ** 2)
         loss_mean=terms["mse"].mean()         
         print("loss_mean",loss_mean)
-        #pdb.set_trace()
-
-        
+        model_kwargs_ = dict(y=y, return_last=True)
         predicted_x_0=from_patch_seq_all(predicted_x_0, H, W).squeeze(1)
         predicted_x_0 = vae.decode(predicted_x_0 / 0.18215).sample  
         self.save_image_lmy(predicted_x_0, f"alllast_0")
-        #pdb.set_trace()
 
         for step in it:
-            next_patch = model(z_start[:,:num_patch+step], **model_kwargs)  # 期望 (B, 1, C, P, P)
-            
+            next_patch = model(z_start[:,:num_patch+step-1], **model_kwargs_)  # 期望 (B, 1, C, P, P)
             seq = th.cat([seq, next_patch], dim=1)
             if step % num_patch == 0:
                 #print(seq[:,  -num_patch:,...].shape)
@@ -898,11 +892,13 @@ class GaussianDiffusion:
                 terms={}
                 target=z_start[:,step:step+num_patch]
                 model_output = seq[:,-num_patch:]
-
+                 
                 target = target.flatten(0, 1) 
                 model_output=model_output.flatten(0, 1) 
                 terms["mse"] = mean_flat((target - model_output) ** 2)
-                loss_mean=terms["mse"].mean()                 
+                loss_mean=terms["mse"].mean() 
+                print("step:",step,"   loss:",loss_mean.item(),"   ",seq.shape,"     ",z_start.shape)
+                #pdb.set_trace()                
                 #pdb.set_trace()
                 samples=from_patch_seq_all(seq[:, -num_patch:,...], H, W)
                 if self.model_mean_type == ModelMeanType.EPSILON:
@@ -931,6 +927,8 @@ class GaussianDiffusion:
             # 清理不需要的变量，释放显存
             del next_patch
             th.cuda.empty_cache()
+        print(th.equal(model_all_out[:,:-1], seq[:,1:]))
+        pdb.set_trace()
         return seq  # (B, L_final, C, P, P)
 
     def _vb_terms_bpd(
@@ -1291,341 +1289,165 @@ class GaussianDiffusion:
         return terms
     
 
-    def ss_training_losses(self, model, x_start, t, custom_detailed_log, vae, model_kwargs=None,ss_settings=None):
+    def ss_training_losses(
+        self, model, x_start, t, custom_detailed_log, vae,
+        model_kwargs=None, ss_settings=None
+    ):
         """
-        Compute training losses for a single timestep.
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: [N x T], a sequence of timesteps onuse for each picture.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
+        Compute training losses with Scheduled Sampling (SS) and/or K-step Unrolling (KSU).
+        包含 3 个核心步骤：
+        A) SS: 在起点之前的片段上，随机替换为 teacher 预测值（roll-in, no grad）
+        B) KSU: 从随机起点 t0 向后 rollout K 步（roll-in, no grad）
+        C) 用修改后的序列做前向计算 loss（带梯度）
         """
-        
+
+        # ----------- 0. 参数准备 -----------
         if model_kwargs is None:
             model_kwargs = {}
         assert t is not None
         if isinstance(t, int):
+            # 扩展成 batch 维度
             t = th.tensor([t] * x_start.shape[0], device=x_start.device)
 
         self.step_count += 1
+
+        # ----------- 1. 生成 noisy 序列 (diffusion input) -----------
         if self.training_settings['fixed_sequence']:
+            # 固定一个序列用于可复现
             if self.step_count == 1:
                 self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
-                th.save(self.memory_seq[0], os.path.join(custom_detailed_log['folder'],"saved_x_t_all.pt"))
-            x_t_all_ori,noise_all = self.memory_seq
+                th.save(
+                    self.memory_seq[0],
+                    os.path.join(custom_detailed_log['folder'], "saved_x_t_all.pt")
+                )
+            x_t_all_ori, noise_all = self.memory_seq
         else:
-            x_t_all_ori,noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
+            x_t_all_ori, noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
 
-        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size) # (B, T, C, H, W) -> (B, TN(time*num_patch), C, H, W)
-        
+        # 转 patch 序列：(B, T, C, H, W) -> (B, TN=T*num_patch, C, PH, PW)
+        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size)
         B, TN, C, PH, PW = x_t_all.shape
         _, T, _, H, W = x_t_all_ori.shape
-        N = TN // T
+        N = TN // T  # 每帧的 patch 数
+
         terms = {}
+        # teacher 序列，始终保留用于监督
         x_t_teacher = x_t_all.clone()
-        eos_patch = th.zeros_like(x_t_all[:, 0])
-        # ------ 读取超参 ------
+        eos_patch = th.zeros_like(x_t_all[:, 0])  # 终止 token (EOS)
+
+        # ----------- 2. 读取配置 -----------
         ksu_cfg = (ss_settings or {}).get("ksu", {})
         ss_cfg  = (ss_settings or {}).get("ss", {})
-        K       = int(ksu_cfg.get("K", 0))
-        p_batch = float(ksu_cfg.get("batch_enable_prob", 1.0))
-        num_t0  = int(ksu_cfg.get("num_t0", 1))          # << 新增：一次加噪里采几个 t0
-        p_ss     = float(ss_cfg.get("p", 0.0))
+        K       = int(ksu_cfg.get("K", 0))          # K 步 rollout
+        num_t0  = int(ksu_cfg.get("num_t0", 1))     # 每个 batch 采几个 t0
+        p_ss    = float(ss_cfg.get("p", 0.0))       # scheduled sampling 概率
 
-        # ------ 可选：如果这一步不想开 KSU，直接回退到单 t0，也能跑 ------
-        enable_ksu_this_batch = (K > 0) and (th.rand((), device=x_t_all.device).item() < p_batch)
-        if not enable_ksu_this_batch:
-            #print("not enable_ksu")
-            num_t0 = 1  # 只做一次 roll-in（仍然能跑完整训练）
-
-        # ------ 预计算：给 SS 用的 base 预测（在“干净序列”上，只算一次） ------
+        # ----------- 3. 预计算：SS 基础预测 (no grad) -----------
         pred_all_base = None
         if p_ss > 0.0:
-            #print("begin ss")
             was_training = model.training
             model.eval()
             with th.no_grad():
-                pred_all_base = model(x_t_all, **(model_kwargs))  # (B, TN, C, PH, PW)
-            if was_training: model.train()
+                # 在干净序列上算一次全预测
+                pred_all_base = model(x_t_all, **model_kwargs)  # (B, TN, C, PH, PW)
+            if was_training: 
+                model.train()
             pred_all_base = pred_all_base.detach()
-            # 与一步目标对齐：用 pred[:, i-1] 替换 x[:, i]
-            pred_shift_base = th.cat([x_t_all[:, :1, ...], pred_all_base[:, :-1, ...]], dim=1)
-            #print("finished ss")
+
+            # 对齐 next-step: pred[:, i-1] -> 替换 x[:, i]
+            pred_shift_base = th.cat(
+                [x_t_all[:, :1, ...], pred_all_base[:, :-1, ...]],
+                dim=1
+            )
         else:
-            pred_shift_base = None
+            # 不做 SS，直接保留原序列
+            pred_shift_base = x_t_all.clone()
 
         losses = []
 
-        # ------ 采样 num_t0 个起点（去重避免浪费；边界 [64, TN-1]） ------
-        low, high = N, TN  # randint 上界是开区间
+        # ----------- 4. 抽样 t0 起点 -----------
+        # 保证至少从第 N (第一个完整帧) 开始，不超界
+        low, high = N, TN - K
         if high <= low:
-            t0_list = [N]  # 保障
+            t0_list = [N]  # fallback
         else:
-            # 允许重复也没关系；要去重可用 unique_consecutive 或 set
-            t0_list = th.randint(low=low, high=high, size=(num_t0,), device=x_t_all.device).tolist()
-        
+            # 随机采样多个 t0 (允许重复)
+            t0_list = th.randint(
+                low=low, high=high, size=(num_t0,), device=x_t_all.device
+            ).tolist()
+
         for t0 in t0_list:
-            # 每个 t0 都从“干净序列”拷贝一份
+            # 每个 t0 从 teacher 序列重新拷贝
             seq = x_t_all.clone()
-            
-            # ------- A) SS：只在 [64, t0-8) 做（roll-in，无梯度） -------
+
+            # ------- A) Scheduled Sampling -------
             if p_ss > 0.0:
-                ss_end = max(N, t0 - 8)  # 右开区间
+                # 只在 [N, t0-K) 替换（即起点之前的部分）
+                ss_end = max(N, t0 - K)
                 if ss_end > N:
                     L = ss_end - N
+                    # 随机 mask，决定哪些位置替换为模型预测
                     ss_mask = (th.rand(B, L, 1, 1, 1, device=seq.device) < p_ss)
                     seg = seq[:, N:ss_end, ...]
                     seg = th.where(ss_mask, pred_shift_base[:, N:ss_end, ...], seg)
                     seq = th.cat([seq[:, :N, ...], seg, seq[:, ss_end:, ...]], dim=1)
-            
-            # ------- B) KSU：从 t0 向后滚 K 步（允许跨帧；越界提前停；roll-in，无梯度） -------
-            if enable_ksu_this_batch and K > 0:
+
+            # ------- B) K-step Unrolling -------
+            if K > 0:
                 was_training = model.training
                 model.eval()
-                j_stop = min(t0 + K - 1, TN - 2)  # 确保写回 j+1 不越界
+                # 从 t0 开始 rollout，最多到 t0+K-1，不超过 TN-2
+                j_stop = min(t0 + K - 1, TN - 2)
                 for j in range(t0, j_stop + 1):
                     with th.no_grad():
-                        pred_step = model(seq, **(model_kwargs or {}))  # (B, TN, C, PH, PW)
-                    # 对齐“一步目标”：pred[:, j] 写回到输入的 j+1
+                        pred_step = model(seq, **(model_kwargs or {}))
+                    # 把 pred[:, j] 写回到输入的 j+1
                     seq[:, j + 1, ...] = pred_step[:, j, ...].detach()
-                if was_training: model.train()
-            
-            # ------- C) 这一次“带梯度”的前向：用 seq 算 loss -------
+                if was_training: 
+                    model.train()
+
+            # ------- C) 正式前向 & 计算 loss -------
             model_output = model(seq, **model_kwargs)  # (B, TN, C, PH, PW)
-            
-            # === 按你原先的 target 逻辑（use_real_target 分支） ===
+
+            # 监督信号（teacher 强制对齐，最后补 eos）
             if self.training_settings['use_real_target']:
-                target = th.cat([x_t_teacher[:, 1:], eos_patch.unsqueeze(1)], dim=1)  # teacher！
+                target = th.cat([x_t_teacher[:, 1:], eos_patch.unsqueeze(1)], dim=1)
                 LEN = TN
             else:
-                # 如果用 posterior/noise 目标，也要把 x_t_all 换回 x_t_teacher
-                assert 0
-            
-            # 可选：不预测 EOS 就裁掉末尾
-            model_out_use = model_output
-            target_use = target
-            if not self.training_settings['predict_eos_patch']:
-                model_out_use = model_out_use[:, :-1, ...]
-                target_use    = target_use[:, :-1, ...]
-                LEN -= 1
+                assert 0, "Posterior/noise 目标未实现"
 
-            # mask（你原来未定义，这里给全 1；需要可替换）
-            
+            # reshape 成 patch 空间
+            model_out_use = model_output.reshape(B * LEN, C, PH, PW)
+            target_use    = target.reshape(B * LEN, C, PH, PW)
 
-            model_out_use = model_out_use.reshape(B * LEN, C, PH, PW)
-            target_use    = target_use.reshape(B * LEN, C, PH, PW)
-
+            # 根据 loss_type 计算
             if self.training_settings['loss_type'] == "MSE":
                 loss_m = mean_flat((target_use - model_out_use) ** 2)
             elif self.training_settings['loss_type'] == "L1":
                 loss_m = mean_flat(th.abs(target_use - model_out_use))
             else:
-                loss_per_elem = F.huber_loss(model_out_use, target_use, reduction="none", delta=1.0)
-                loss_m = mean_flat(loss_per_elem )
+                loss_per_elem = F.huber_loss(
+                    model_out_use, target_use, reduction="none", delta=1.0
+                )
+                loss_m = mean_flat(loss_per_elem)
 
             losses.append(loss_m)
 
-        # ------ 汇总：多个 t0 的 loss 取平均（保持学习率语义） ------
+        # ----------- 5. 汇总 -----------
         terms["mse"]  = th.stack(losses).mean()
         terms["loss"] = terms["mse"]
+
+        # 记录日志
         self.logging(
             infos={
-                "x_t_all":x_t_all_ori, 
-                "noise_all":noise_all, 
-                "terms":terms,
-                "eos_patch":eos_patch,
-                "y":model_kwargs['y'] if model_kwargs is not None else None
-                }, 
-            log_settings=custom_detailed_log
-        )
-        return terms
-    def all_kstep_ss_training_losses(self, model, x_start, t, custom_detailed_log, vae,
-                                    model_kwargs=None, ss_settings=None):
-        """
-        Per-step 监督（显存友好版）：
-        - SS:   只在 [64, t0-8) 做（roll-in, no_grad, detach）
-        - KSU:  从 t0 起逐步 roll-in；对前 S-1 步在函数内即时 backward（no_sync），
-                只把最后一步的 loss/S 返回给外层 backward，避免累计图导致 OOM。
-        """
-        import torch as th
-        import torch.nn.functional as F
-        import os
-
-        if model_kwargs is None:
-            model_kwargs = {}
-        assert t is not None
-        if isinstance(t, int):
-            t = th.tensor([t] * x_start.shape[0], device=x_start.device)
-
-        # ===== 生成加噪序列 =====
-        self.step_count += 1
-        if self.training_settings['fixed_sequence']:
-            if self.step_count == 1 and custom_detailed_log:
-                self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
-                try:
-                    th.save(self.memory_seq[0],
-                            os.path.join(custom_detailed_log['folder'], "saved_x_t_all.pt"))
-                except Exception:
-                    pass
-            x_t_all_ori, noise_all = self.memory_seq
-        else:
-            x_t_all_ori, noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
-
-        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size)  # (B, TN, C, PH, PW)
-        B, TN, C, PH, PW = x_t_all.shape
-        _, T, _, H, W = x_t_all_ori.shape
-        N = TN // T
-
-        terms = {}
-        x_t_teacher = x_t_all.clone()
-        eos_patch = th.zeros_like(x_t_all[:, 0])
-
-        # ===== 超参 =====
-        ksu_cfg = (ss_settings or {}).get("ksu", {})
-        ss_cfg  = (ss_settings or {}).get("ss", {})
-
-        K        = int(ksu_cfg.get("K", 0))
-        p_batch  = float(ksu_cfg.get("batch_enable_prob", 1.0))
-        num_t0   = int(ksu_cfg.get("num_t0", 1))
-        p_ss     = float(ss_cfg.get("p", 0.0))
-
-        enable_ksu_this_batch = (K > 0) and (th.rand((), device=x_t_all.device).item() < p_batch)
-        if not enable_ksu_this_batch:
-            num_t0 = 1
-
-        # ===== SS 的 base 预测（一次，无梯度） =====
-        pred_shift_base = None
-        if p_ss > 0.0:
-            was_training = model.training
-            model.eval()
-            with th.no_grad():
-                pred_all_base = model(x_t_all, **(model_kwargs or {}))
-            if was_training: model.train()
-            pred_all_base = pred_all_base.detach()
-            pred_shift_base = th.cat([x_t_all[:, :1, ...], pred_all_base[:, :-1, ...]], dim=1)
-
-        # ===== 采样 t0 =====
-        low, high = N, TN-8
-        if high <= low:
-            t0_list = [N]
-        else:
-            t0_list = th.randint(low=low, high=high, size=(num_t0,), device=x_t_all.device).tolist()
-
-        # ===== 先“预数”总监督步数 S，用于平均 & no_sync 控制 =====
-        total_supervised = 0
-        for t0 in t0_list:
-            steps = (K if enable_ksu_this_batch else 1)
-            j_stop = min(t0 + steps - 1, TN - 2)
-            for j in range(t0, j_stop + 1):
-                skip_loss = (not self.training_settings['predict_eos_patch']) and (j == TN - 2)
-                if not skip_loss:
-                    total_supervised += 1
-        # 防御：没有监督步就返回 0
-        if total_supervised == 0:
-            zero = th.tensor(0.0, device=x_t_all.device, dtype=x_t_all.dtype)
-            terms["mse"] = zero
-            terms["loss"] = zero
-            if custom_detailed_log:
-                self.logging(
-                    infos={"x_t_all": x_t_all_ori, "noise_all": noise_all, "terms": terms,
-                        "eos_patch": eos_patch,
-                        "y": model_kwargs.get('y') if model_kwargs is not None else None},
-                    log_settings=custom_detailed_log
-                )
-            return terms
-
-        # ===== 正式训练：前 S-1 步在函数内 backward，最后一步返回给外层 =====
-        supervised_done = 0
-        last_loss_scaled = None  # 返回给外层 backward 的那一步 loss
-
-        for t0 in t0_list:
-            # 从干净序列拷贝一份工作副本
-            seq = x_t_all.clone()
-            seq.requires_grad_(False)
-
-            # A) SS： [N, t0-8) roll-in（无梯度）
-            if p_ss > 0.0:
-                ss_end = max(N, t0 - 8)
-                if ss_end > N:
-                    L = ss_end - N
-                    ss_mask = (th.rand(B, L, 1, 1, 1, device=seq.device) < p_ss)
-                    seg = seq[:, N:ss_end, ...]
-                    seg = th.where(ss_mask, pred_shift_base[:, N:ss_end, ...], seg)
-                    seq = th.cat([seq[:, :N, ...], seg, seq[:, ss_end:, ...]], dim=1)
-
-            # B) KSU：逐步
-            steps = (K if enable_ksu_this_batch else 1)
-            j_stop = min(t0 + steps - 1, TN - 2)
-
-            for j in range(t0, j_stop + 1):
-                skip_loss = (not self.training_settings['predict_eos_patch']) and (j == TN - 2)
-
-                # 前向用不会被后续写回影响的副本
-                seq_fw = seq.detach().clone()
-                pred_all = model(seq_fw, **(model_kwargs or {}))
-                pred_j = pred_all[:, j, ...]
-                target_j = x_t_teacher[:, j + 1, ...] if self.training_settings['use_real_target'] else None
-                if target_j is None:
-                    assert 0, "per-step 只实现 use_real_target=True"
-                assert pred_j.requires_grad, f"pred_j at step {j} does not require grad"
-                assert pred_j.grad_fn is not None, f"pred_j at step {j} has no grad_fn"
-                # 计算当前步损失
-                if not skip_loss:
-                    if self.training_settings['loss_type'] == "MSE":
-                        loss_j = ((target_j - pred_j) ** 2).flatten(1).mean(dim=1).mean()
-                    elif self.training_settings['loss_type'] == "L1":
-                        loss_j = th.abs(target_j - pred_j).flatten(1).mean(dim=1).mean()
-                    else:
-                        loss_per_elem = F.huber_loss(pred_j, target_j, reduction="none", delta=1.0)
-                        loss_j = loss_per_elem.flatten(1).mean(dim=1).mean()
-
-                    supervised_done += 1
-                    loss_scaled = loss_j / float(total_supervised)
-
-                    # 决定是内部 backward 还是留给外层
-                    if supervised_done < total_supervised:
-                        # 不是最后一步：内部反传并避免多次 all-reduce
-                        try:
-                            no_sync_ctx = model.no_sync() if hasattr(model, "no_sync") else nullcontext()
-                        except Exception:
-                            # 兼容非 DDP 情况
-                            from contextlib import nullcontext
-                            no_sync_ctx = nullcontext()
-                        with no_sync_ctx:
-                            loss_scaled.backward()
-                    else:
-                        # 最后一步：留给外层 backward
-                        last_loss_scaled = loss_scaled
-
-                # 喂回到 j+1（roll-in，无梯度）
-                with th.no_grad():
-                    seq[:, j + 1, ...] = pred_j.detach()
-
-        # 返回最后一步 loss（已按 S 平均）
-        assert last_loss_scaled is not None, "last_loss_scaled should not be None"
-        assert last_loss_scaled.ndim == 0, f"loss should be scalar, got shape {last_loss_scaled.shape}"
-        terms["mse"] = last_loss_scaled
-        terms["loss"] = last_loss_scaled
-
-        # 可选日志
-        if custom_detailed_log:
-            infos = {
                 "x_t_all": x_t_all_ori,
                 "noise_all": noise_all,
                 "terms": terms,
                 "eos_patch": eos_patch,
-                "y": model_kwargs.get('y') if model_kwargs is not None else None
-            }
-            try:
-                if 'pred_all' in locals() and pred_all is not None:
-                    infos["x_pred_all"] = from_patch_seq_all(pred_all[:, max(N-1, 0):-1, ...], H, W)
-                    infos["model_output"] = pred_all
-            except Exception:
-                pass
-            self.logging(infos=infos, log_settings=custom_detailed_log)
+                "y": model_kwargs['y'] if model_kwargs is not None else None
+            },
+            log_settings=custom_detailed_log
+        )
 
         return terms
 

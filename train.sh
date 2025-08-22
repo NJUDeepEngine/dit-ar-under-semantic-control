@@ -10,21 +10,20 @@ for arg in "$@"; do
     fi
 done
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=1,2
 
 # 使用数组构建命令
 CMD=(
     torchrun
     --nnodes=1
-    --nproc_per_node=1
+    --nproc_per_node=2
     --master_port=29502
     train_copy.py
     --model DiT-L/4
-    --global-batch-size 12
+    --global-batch-size 8
     --data-path /data0/lmy/imagenette2/train
     --num-classes 10
-    --max_gen_len 1000
-    --epochs 5
+    --epochs 7
     --ckpt-every 500
     --detailed-log-every 500
     --detailed-log-pic-print
@@ -33,8 +32,9 @@ CMD=(
     --loss-type huber
     --use-real-target
     --use_ss
-    --results-dir /data3/lmy/train_style-check
+    --results-dir /data3/lmy/ss_ksu-check
     --vae-path '/data0/dit-assets/sd-vae-ft-ema'
+    --predict-eos-patch
     --description 'use ss,mse loss type test; 1g dataset, unfixed sequence, print all middle vars; do not predict eos patch; t = 20'
 )
 

@@ -40,6 +40,67 @@ from diffusers.models import AutoencoderKL
 #                             Training Helper Functions                         #
 #################################################################################
 
+import random
+
+def training_scheduler(train_step, total_steps):
+    """
+    训练调度函数：根据当前步数，抽签决定 full-seq / KSU / rollout K
+    
+    Args:
+        train_step (int): 当前训练步
+        total_steps (int): 总训练步数 (如 16500)
+    
+    Returns:
+        dict: {
+            "mode": "fullseq" or "ksu",
+            "K": int (仅 KSU 时有意义),
+            "enable_rollout": bool
+        }
+    """
+    p_ss, p_ss_near = 0.0, 0.0
+    # ===== 阶段划分 =====
+    ratio = train_step / total_steps
+    if ratio < 0.3:          # 前30%
+        fullseq_prob = 0.9
+        ksu_prob = 0.1
+        K = 4
+        ksu_batch_prob = 0.5 + 0.2 * (ratio / 0.3)  # 0.5 -> 0.7
+    elif ratio < 0.7:        # 中间40%
+        fullseq_prob = 0.5
+        ksu_prob = 0.5
+        K = 8
+        ksu_batch_prob = 0.7 + 0.2 * ((ratio - 0.3) / 0.4)  # 0.7 -> 0.9
+    else:                    # 最后30%
+        fullseq_prob = 0.3
+        ksu_prob = 0.7
+        K = 16
+        ksu_batch_prob = 0.9 + 0.1 * ((ratio - 0.7) / 0.3)  # 0.9 -> 1.0
+    
+    # ===== 第一次抽签：决定模式 =====
+    if random.random() < fullseq_prob:
+        return {"mode": "fullseq", "K": 0, "enable_rollout": False,"p_ss":p_ss,"p_ss_near":p_ss_near}
+    
+    # ===== 第二次抽签：进入 KSU，决定是否 rollout =====
+    enable_rollout = random.random() < ksu_batch_prob
+
+    ss_end_step = int(0.3 * total_steps)   # 前 30% 步数内线性涨满
+    ss_p_end    = 0.4
+    p_ss = linear_schedule(
+        step=train_step,
+        start_step=0,
+        end_step=ss_end_step,
+        start_val=0.0,
+        end_val=ss_p_end
+    )
+    near_frame_boost = 1.25
+    p_ss_near = min(0.5, p_ss * near_frame_boost)
+
+    if enable_rollout:
+        return {"mode": "ksu", "K": K, "enable_rollout": True,"p_ss":p_ss,"p_ss_near":p_ss_near}
+    else:
+        return {"mode": "ksu", "K": 1, "enable_rollout": False,"p_ss":p_ss,"p_ss_near":p_ss_near}
+
+
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
@@ -207,8 +268,8 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     )
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
+    #ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    #requires_grad(ema, False)
     
     custom_training_settings = {
         "fixed_sequence": args.fixed_sequence,  
@@ -316,16 +377,13 @@ def main(args):
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
-    update_ema(ema, model.module, decay=0)
+    #update_ema(ema, model.module, decay=0)
     # Prepare models for training:
     model.train()
-    ema.eval()
+    #ema.eval()
+    print("new ss ksu")
     # Variables for monitoring/logging purposes:
-    #train_steps = 0
-    log_steps = 0
-    running_loss = 0
-    start_time = time()
-
+    total_steps=len(dataset)//args.global_batch_size * args.epochs
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
@@ -337,74 +395,39 @@ def main(args):
                 latent = vae.encode(x).latent_dist.sample().mul_(0.18215)
             rand_t = args.rand_t
             t = torch.full((latent.shape[0],), rand_t, device=device, dtype=torch.long)
-            
-            return_last= False
-            model_kwargs = dict(y=y,return_last=return_last) 
-            # 计算当前batch的损失
-            opt.zero_grad(set_to_none=True)
-            
+            if args.use_ss:
+                decision = training_scheduler(train_steps, total_steps)
+                mode=decision["mode"]
+                k=decision["K"]
+                enable_rollout=decision["enable_rollout"]
+                p_ss = decision["p_ss"]
+                p_ss_near = decision["p_ss_near"]
+                return_last= False
+                model_kwargs = dict(y=y,return_last=return_last) 
+                # 计算当前batch的损失
+                opt.zero_grad(set_to_none=True)
+                if mode=="fullseq":
+                    loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
+                elif mode=="ksu":
+                    ss_settings = {
+                        "ksu":{
+                            "k":k,
+                            "enable_rollout":enable_rollout,
+                            "num_t0":6
+                        },
+                        "ss": {
+                            "p": float(p_ss),
+                            "p_near": float(p_ss_near),
+                        }
+                    }
 
-            k1 = getattr(args, "ksu_k1_step", 20_000)   # K=2 -> 4 的切换步
-            k2 = getattr(args, "ksu_k2_step", 60_000)   # K=4 -> 8 的切换步
-            K_max_default = getattr(args, "ksu_k_max", 8)
-
-            # K 的课程式调度
-            if train_steps < k1:
-                K_cur = 2
-            elif train_steps < k2:
-                K_cur = 4
+                    loss_dict = diffusion.ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             else:
-                K_cur = K_max_default
-            # 可选：并不是每个 batch 都开 KSU，先 50% -> 100%
-            ksu_batch_prob = linear_schedule(
-                step=train_steps,
-                start_step=0,
-                end_step=k1,
-                start_val=0.5,
-                end_val=1.0
-            )
-
-            # 历史帧 SS 概率：0 -> p_end，线性到位（默认 60k 步达顶）
-            ss_end_step = getattr(args, "ss_end_step", 60_000)
-            ss_p_end    = getattr(args, "ss_p_end", 0.35)  # 0.3~0.4 常用；先 0.35
-            p_ss = linear_schedule(
-                step=train_steps,
-                start_step=0,
-                end_step=ss_end_step,
-                start_val=0.0,
-                end_val=ss_p_end
-            )
-
-            # （可选）最近历史帧稍微更“脏”一点；不想用就设为 1.0
-            near_frame_boost = getattr(args, "ss_near_boost", 1.25)
-            p_ss_near = min(0.5, p_ss * near_frame_boost)   # 限到 0.5，稳一些
-          
-
-            ss_settings = {
-                "ksu": {
-                    "K": int(K_cur),                 # 当前 K
-                    "batch_enable_prob": float(ksu_batch_prob),
-                    "t0_strategy": "uniform_0_to_63_minus_K",
-                    "detach_feedback": True,         # 仍然建议 detach
-                    "num_t0":6,
-                },
-                "ss": {
-                    "enable": True,
-                    "scope": "past_frames",
-                    "p": float(p_ss),
-                    "p_near": float(p_ss_near),
-                    "detach_feedback": True,         # 同样 detach
-                }
-            }
-            if not args.use_ss:
                 loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
-            else:
-                #print("use ss and ksu training style")
-                loss_dict = diffusion.all_kstep_ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             loss = loss_dict["loss"].mean()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            #update_ema(ema, model.module)
             # 记录损失值
             running_loss += loss.detach().item()
             log_steps += 1
@@ -439,7 +462,6 @@ def main(args):
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
                         "train_steps": train_steps,
@@ -470,12 +492,11 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--global-batch-size", type=int, default=32)
+    parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=100)
-    parser.add_argument("--max_gen_len", type=int, default=1000)
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="your_project")
     parser.add_argument("--wandb-team",type=str,default="nju-ics")
@@ -494,18 +515,10 @@ if __name__ == "__main__":
     parser.add_argument("--fixed-sequence", action="store_true")
     parser.add_argument("--use-real-target", action="store_true")
     parser.add_argument("--predict-eos-patch", action="store_true")
-    parser.add_argument("--rand-t", type=int, default=100)
+    parser.add_argument("--rand-t", type=int, default=20)
     parser.add_argument("--loss-type", type=str, default="MSE")
     parser.add_argument("--use_ss",action="store_true")
+    parser.add_argument("--ksu_k_max", type=int, default=16)
+    parser.add_argument("--ss_near_boost", type=float, default=1.25)
     args = parser.parse_args()
     main(args)
-"""
-CUDA_VISIBLE_DEVICES=2,3 torchrun \
---nnodes=1 \
---nproc_per_node=2 \
-train.py \
---model DiT-XL/2 \
---data-path /path/to/imagenet/train \
---num-classes 10 \
---max_gen_len 1000
-"""

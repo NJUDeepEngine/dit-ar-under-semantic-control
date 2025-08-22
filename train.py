@@ -344,8 +344,8 @@ def main(args):
             opt.zero_grad(set_to_none=True)
             
 
-            k1 = getattr(args, "ksu_k1_step", 20_000)   # K=2 -> 4 的切换步
-            k2 = getattr(args, "ksu_k2_step", 60_000)   # K=4 -> 8 的切换步
+            k1 = getattr(args, "ksu_k1_step", 2_000)   # K=2 -> 4 的切换步
+            k2 = getattr(args, "ksu_k2_step", 6_000)   # K=4 -> 8 的切换步
             K_max_default = getattr(args, "ksu_k_max", 8)
 
             # K 的课程式调度

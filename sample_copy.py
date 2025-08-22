@@ -57,13 +57,13 @@ def main(args):
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     
-    x = torch.load("/data3/lmy/ss_ksu_result/single_step/11500/x_t_all.pt", map_location="cpu")
+    x = torch.load("/data3/lmy/ss_ksu-check/011-DiT-L-4/8000/x_t_all.pt", map_location="cpu")
 
     # 取出 x 和 y
-    y = torch.load("/data3/lmy/ss_ksu_result/single_step/11500/y.pt", map_location="cpu")  # (B,)
+    y = torch.load("/data3/lmy/ss_ksu-check/011-DiT-L-4/8000/y.pt", map_location="cpu")  # (B,)
     x=x.to(device)
     y=y.to(device)
-    x=x[:,:1]
+    #x=x[:,:1]
     #x_t_all=to_patch_seq_all(x,args.patch_size)
     x = x.to(device)
     x=to_patch_seq_all(x,args.patch_size)
@@ -122,7 +122,7 @@ def main(args):
     #)
     #pdb.set_trace()
     #samples = diffusion.ar_sample_test(model.forward,z_start.shape,z_start,max_gen_len=max_gen_len,clip_denoised=False,model_kwargs=model_kwargs,device=device,num_patch=num_patches,vae_path="/data0/lmy/dit-ar-under-semantic-control/vae")
-    samples = diffusion.ar_p_sample_loop(model.forward,z_start.shape,z_start,max_gen_len=max_gen_len,clip_denoised=False,model_kwargs=model_kwargs,device=device,num_patch=num_patches,vae_path="/data0/lmy/dit-ar-under-semantic-control/vae")
+    samples = diffusion.ar_sample_test(model.forward,z_start.shape,z_start,max_gen_len=max_gen_len,clip_denoised=False,model_kwargs=model_kwargs,device=device,num_patch=num_patches,vae_path="/data0/lmy/dit-ar-under-semantic-control/vae")
    
     #samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     #pdb.set_trace()
