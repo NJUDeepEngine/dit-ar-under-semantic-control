@@ -407,6 +407,7 @@ def main(args):
                 # 计算当前batch的损失
                 opt.zero_grad(set_to_none=True)
                 if mode=="fullseq":
+                    #print("11111111111111111111111111")
                     loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
                 elif mode=="ksu":
                     ss_settings = {
@@ -420,8 +421,8 @@ def main(args):
                             "p_near": float(p_ss_near),
                         }
                     }
-
-                    loss_dict = diffusion.ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
+                    #print("22222222222222")
+                    loss_dict = diffusion.full_ksu_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             else:
                 loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
             loss = loss_dict["loss"].mean()
