@@ -719,7 +719,6 @@ class GaussianDiffusion:
         B, L0, C, P, _ = seq.shape
         assert max_gen_len >= L0, f"max_gen_len({max_gen_len}) 必须 ≥ 起始长度 L0({L0})"
         max_new = max_gen_len-L0+num_patch
-
         # EOS：全 0 patch；阈值可调整
         eos_token = th.zeros(C, P, P, device=device, dtype=seq.dtype)  # 精确 0，便于后续等号判断
         eos_exp = eos_token.view(1, 1, C, P, P)                           # 便于广播
@@ -781,12 +780,6 @@ class GaussianDiffusion:
                 
 
                 samples=from_patch_seq_all(seq[:, -num_patch:,...], H, W)
-                semples_seq_all=to_patch_seq_all(samples, P)
-                samples_=from_patch_seq_all(semples_seq_all, H, W)
-                samples_seq_all=to_patch_seq_all(samples_,P)
-                
-                assert(th.allclose(samples, samples_, atol=1e-6))
-                assert(th.allclose(semples_seq_all, samples_seq_all, atol=1e-6))
 
                 #samples = seq[:, -num_patch:]  # 形状 (B, num_patch, C, P, P)
                 # 形状变为 (B, C, H, W)
@@ -807,6 +800,7 @@ class GaussianDiffusion:
                 picture_t = vae.decode(xt_minus_1 / 0.18215).sample  # VAE 解码
                 last_xt=xt_minus_1    
                 self.save_image_lmy(picture_t, f"generated_{step//num_patch}")  # 保存图像
+                
                     
 
             # 清理不需要的变量，释放显存
@@ -894,6 +888,7 @@ class GaussianDiffusion:
                  
                 target = target.flatten(0, 1) 
                 model_output=model_output.flatten(0, 1) 
+                #pdb.set_trace()
                 terms["mse"] = mean_flat((target - model_output) ** 2)
                 loss_mean=terms["mse"].mean() 
                 print("step:",step,"   loss:",loss_mean.item(),"   ",seq.shape,"     ",z_start.shape)
@@ -1250,22 +1245,19 @@ class GaussianDiffusion:
                 mask = mask[:,(TN-LEN):,...]
                 model_output = model_output[:,(TN-LEN):,...]
                 target = target[:,:LEN,...]
-
+            mask = mask.reshape(B,LEN,1,1,1).float()
             if not self.training_settings['predict_eos_patch']:
                 target = target[:, :-1, ...]
                 mask = mask[:,:-1,...]
                 model_output = model_output[:,:-1,...]
                 LEN = LEN-1
-            mask = mask.reshape(B * LEN, 1, 1, 1).float()
-            model_output = model_output.reshape(B * LEN, C, PH, PW)
-            target = target.reshape(B * LEN, C, PH, PW)
             if self.training_settings['loss_type'] == "MSE":
-                terms["mse"] = mean_flat((target - model_output) ** 2 * mask)
+                terms["mse"] = self.apply_epsilon_scale_mean(((target - model_output) ** 2),t,mask)
             elif self.training_settings['loss_type'] == "L1":
-                terms["mse"] = mean_flat(th.abs(target - model_output) * mask)
+                terms["mse"] = self.apply_epsilon_scale_mean(th.abs(target - model_output),t,mask)
             elif self.training_settings['loss_type'] == "huber":
                 loss_per_elem = F.huber_loss(model_output, target, reduction="none", delta=1.0)
-                terms["mse"] = mean_flat(loss_per_elem * mask)
+                terms["mse"] = self.apply_epsilon_scale_mean(loss_per_elem,t,mask)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
@@ -1286,7 +1278,9 @@ class GaussianDiffusion:
         )
 
         return terms
-    def apply_epsilon_scale(self, loss: th.Tensor, t: th.LongTensor):
+    
+
+    def apply_epsilon_scale_mean(self, loss: th.Tensor, t: th.LongTensor, mask: th.Tensor = None):
         B, TN, C, P, _ = loss.shape
         device = loss.device
 
@@ -1302,18 +1296,26 @@ class GaussianDiffusion:
 
         N = self.image_converter.num_patch
         sigma_t = sigma_t.unsqueeze(-1).repeat(1, 1, N)  # (B, T, N)
-        sigma_t = sigma_t.view(t.shape[0], -1, 1, 1, 1)  # (B, TN, 1, 1, 1)
+        sigma_t = sigma_t.reshape(t.shape[0], -1, 1, 1, 1)  # (B, TN, 1, 1, 1)
         sigma_t_expanded = sigma_t.expand(-1, -1, C, P, P)  # (B, TN, C, P, P)
+
+        if mask == None:
+            mask = 1
 
         if N * t.shape[1] == TN:
             sigma_t_expanded = th.cat([
                 sigma_t_expanded[:, 1:],  # shift
-                th.zeros_like(sigma_t_expanded[:, 0]).unsqueeze(1)
+                th.ones_like(sigma_t_expanded[:, 0]).unsqueeze(1)
             ], dim=1)
+            loss_m =  (mask*(loss / (sigma_t_expanded ** 2)))[:,:-1,...]
+        elif N * t.shape[1]-1 == TN:
+            sigma_t_expanded = sigma_t_expanded[:,1:]
+            loss_m =  (mask*(loss / (sigma_t_expanded ** 2)))
         else:
-            sigma_t_expanded = sigma_t_expanded[:, :loss.shape[1]]
+            sigma_t_expanded = sigma_t_expanded[:, N:]
+            loss_m =  (mask*(loss / (sigma_t_expanded ** 2)))
 
-        return loss / (sigma_t_expanded ** 2)
+        return mean_flat(loss_m.reshape(-1,C,P,P))
   
 
     def ss_training_losses(
@@ -1456,7 +1458,7 @@ class GaussianDiffusion:
                 loss_m = F.huber_loss(
                     model_out_use, target_use, reduction="none", delta=1.0
                 )
-            
+            pdb.set_trace()
             loss_m=loss_m.reshape(B,LEN,C,PH,PW)
             pdb.set_trace()
             loss_m=self.apply_epsilon_scale(loss_m,t)
@@ -1465,6 +1467,111 @@ class GaussianDiffusion:
             pdb.set_trace()
             losses.append(loss_m)
 
+        # ----------- 5. 汇总 -----------
+        terms["mse"]  = th.stack(losses).mean()
+        terms["loss"] = terms["mse"]
+
+        # 记录日志
+        self.logging(
+            infos={
+                "x_t_all": x_t_all_ori,
+                "noise_all": noise_all,
+                "terms": terms,
+                "eos_patch": eos_patch,
+                "y": model_kwargs['y'] if model_kwargs is not None else None
+            },
+            log_settings=custom_detailed_log
+        )
+
+        return terms
+    
+    def full_ksu_training_losses(
+        self, model, x_start, t, custom_detailed_log, vae,
+        model_kwargs=None, ss_settings=None
+    ):
+        """
+        Compute training losses with Scheduled Sampling (SS) and/or K-step Unrolling (KSU).
+        包含 3 个核心步骤：
+        A) SS: 在起点之前的片段上，随机替换为 teacher 预测值（roll-in, no grad）
+        B) KSU: 从随机起点 t0 向后 rollout K 步（roll-in, no grad）
+        C) 用修改后的序列做前向计算 loss（带梯度）
+        """
+
+        # ----------- 0. 参数准备 -----------
+        if model_kwargs is None:
+            model_kwargs = {}
+        assert t is not None
+        if isinstance(t, int):
+            # 扩展成 batch 维度
+            t = th.tensor([t] * x_start.shape[0], device=x_start.device)
+
+        self.step_count += 1
+
+        # ----------- 1. 生成 noisy 序列 (diffusion input) -----------
+        if self.training_settings['fixed_sequence']:
+            # 固定一个序列用于可复现
+            if self.step_count == 1:
+                self.memory_seq = self.generate_diffusion_noise_sequence(x_start, t=t)
+                th.save(
+                    self.memory_seq[0],
+                    os.path.join(custom_detailed_log['folder'], "saved_x_t_all.pt")
+                )
+            x_t_all_ori, noise_all = self.memory_seq
+        else:
+            x_t_all_ori, noise_all = self.generate_diffusion_noise_sequence(x_start, t=t)
+
+        # 转 patch 序列：(B, T, C, H, W) -> (B, TN=T*num_patch, C, PH, PW)
+        x_t_all = to_patch_seq_all(x_t_all_ori, model.module.patch_size)
+        B, TN, C, PH, PW = x_t_all.shape
+        _, T, _, H, W = x_t_all_ori.shape
+        N = TN // T  # 每帧的 patch 数
+
+        terms = {}
+        # teacher 序列，始终保留用于监督
+        x_t_teacher = x_t_all.clone()
+        eos_patch = th.zeros_like(x_t_all[:, 0])  # 终止 token (EOS)
+
+        # ----------- 2. 读取配置 -----------
+        losses=[]
+        was_training = model.training
+        model.eval()
+        seq = x_t_all.clone()
+        # 从 t0 开始 rollout，最多到 t0+K-1，不超过 TN-2
+        for j in range(N, TN-1):
+            with th.no_grad():
+                pred_step = model(seq, **(model_kwargs or {}))
+            # 把 pred[:, j] 写回到输入的 j+1
+                seq[:, j + 1, ...] = pred_step[:, j, ...].detach()
+        if was_training: 
+            model.train()
+
+        # ------- C) 正式前向 & 计算 loss -------
+        model_output = model(seq, **model_kwargs)  # (B, TN, C, PH, PW)
+
+        # 监督信号（teacher 强制对齐，最后补 eos）
+        if self.training_settings['use_real_target']:
+                target = th.cat([x_t_teacher[:, 1:], eos_patch.unsqueeze(1)], dim=1)
+                LEN = TN
+        else:
+                assert 0, "Posterior/noise 目标未实现"
+
+            # reshape 成 patch 空间
+        model_out_use = model_output.reshape(B * LEN, C, PH, PW)
+        target_use    = target.reshape(B * LEN, C, PH, PW)
+
+        # 根据 loss_type 计算
+        if self.training_settings['loss_type'] == "MSE":
+                loss_m = (target_use - model_out_use) ** 2
+        elif self.training_settings['loss_type'] == "L1":
+                loss_m = th.abs(target_use - model_out_use)
+        else:
+                loss_m = F.huber_loss(
+                    model_out_use, target_use, reduction="none", delta=1.0
+                )
+        loss_m=loss_m.reshape(B,LEN,C,PH,PW)
+        loss_m=self.apply_epsilon_scale_mean(loss_m,t)
+        losses.append(loss_m)
+        #pdb.set_trace()
         # ----------- 5. 汇总 -----------
         terms["mse"]  = th.stack(losses).mean()
         terms["loss"] = terms["mse"]
