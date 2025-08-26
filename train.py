@@ -400,7 +400,7 @@ def main(args):
                 loss_dict = diffusion.training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs)
             else:
                 #print("use ss and ksu training style")
-                loss_dict = diffusion.ss_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
+                loss_dict = diffusion.full_ksu_training_losses(model, latent, t, custom_logger_setting, vae, model_kwargs,ss_settings)
             loss = loss_dict["loss"].mean()
             loss.backward()
             opt.step()
