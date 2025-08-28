@@ -52,6 +52,7 @@ class LossType(enum.Enum):
     )  # use raw MSE loss (with RESCALED_KL when learning variances)
     KL = enum.auto()  # use the variational lower-bound
     RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
+    CONBINED = enum.auto()
 
     def is_vb(self):
         return self == LossType.KL or self == LossType.RESCALED_KL
@@ -1157,8 +1158,9 @@ class GaussianDiffusion:
         
         eos_patch = th.zeros_like(x_t_all[:, 0])
         # ！！！KL Loss and vb loss is not needed for now
-        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+        model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+        terms["loss"] = 0.0
+        if self.loss_type == LossType.CONBINED or self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             model_output_ori = model_output
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
@@ -1172,8 +1174,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= t.shape[1]-1
                 
-        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t_all, **model_kwargs) # (B, T*N, C, patch_h, patch_w
+        if self.loss_type == LossType.CONBINED or self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             #pdb.set_trace()
             # x = vae.decode(model_output / 0.18215).sample
             # model_output = vae.encode(x).latent_dist.sample().mul_(0.18215)
@@ -1259,11 +1260,9 @@ class GaussianDiffusion:
                 loss_per_elem = F.huber_loss(model_output, target, reduction="none", delta=1.0)
                 terms["mse"] = self.apply_epsilon_scale_mean(loss_per_elem,t,mask)
             if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
+                terms["loss"] = terms["loss"] + terms["mse"] + terms["vb"]
             else:
-                terms["loss"] = terms["mse"]
-        else:
-            raise NotImplementedError(self.loss_type)
+                terms["loss"] = terms["loss"] + terms["mse"]
         self.logging(
             infos={
                 "x_t_all":x_t_all_ori, 
