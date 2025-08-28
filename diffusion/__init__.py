@@ -22,12 +22,13 @@ def create_diffusion(
     training_settings=None
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
-    if use_kl:
-        loss_type = gd.LossType.KL
-    elif rescale_learned_sigmas:
-        loss_type = gd.LossType.RESCALED_MSE
-    else:
-        loss_type = gd.LossType.MSE
+    # if use_kl:
+    #     loss_type = gd.LossType.KL
+    # elif rescale_learned_sigmas:
+    #     loss_type = gd.LossType.RESCALED_MSE
+    # else:
+    #     loss_type = gd.LossType.MSE
+    loss_type = gd.LossType.CONBINED
     if timestep_respacing is None or timestep_respacing == "":
         timestep_respacing = [diffusion_steps]
     return SpacedDiffusion(
